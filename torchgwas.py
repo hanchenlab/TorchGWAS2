@@ -12,7 +12,7 @@ sys.path.append("build-py")
 sys.path.append("pymodules")
 
 
-def calc_t(pheno_normalized, geno, beta, gamma, sqrt_c2):
+def calc_t(pheno_normalized, geno, beta, gamma, sqrt_c2, ph_std):
     """
     Compute per-SNP stats using pre-normalized phenotypes and on-device sqrt(c2).
 
@@ -20,16 +20,40 @@ def calc_t(pheno_normalized, geno, beta, gamma, sqrt_c2):
     geno: (M, N)
     beta, gamma: (M, P) work buffers on same device as geno
     sqrt_c2_device: (P,) tensor on same device as inputs
+    ph_std: (1, P) phenotype stds computed BEFORE standardizing corrected_res
     """
     N = pheno_normalized.shape[0]
     with torch.no_grad():
-        geno.sub_(geno.mean(1, keepdim=True)).div_(geno.std(1, keepdim=True))
-        torch.matmul(geno, pheno_normalized, out=beta)
-        beta.div_(N)
-        gamma.copy_(beta)
-        gamma.pow_(2).sub_(1).div_(2-N)
-        torch.sqrt(gamma, out=gamma)
+        # Compute stds (keep dims for broadcasting)
+        # geno_std: (M, 1) across samples; ph_std: (1, P) provided from pre-standardized corrected_res
+        geno_std = geno.std(1, keepdim=True, unbiased=False).clamp_min(1e-8)
+        ph_std = ph_std.clamp_min(1e-8)
+
+        # Row-wise center and scale genotypes using saved std (so we can reuse geno_std later)
+        geno.sub_(geno.mean(1, keepdim=True)).div_(geno_std)
+
+        # Score U = X^T Y written into beta (M,P); then convert to r = U/N
+        torch.matmul(geno, pheno_normalized, out=beta)  # (M,N) @ (N,P) -> (M,P)
+        beta.div_(N)  # now beta holds r (correlation) when inputs are standardized
+
+        # Keep an unscaled copy of r for SE(r)
+        r = beta.clone()  # (M,P)
+
+        # As requested: additionally scale beta by phenotype and SNP stds
+        # beta: (M,P) / (1,P) / (M,1) -> (M,P)
+        beta.div_(ph_std)
+        beta.div_(geno_std)
+
+        # Compute SE from r, then scale SE by the same stds
+        gamma.copy_(r)                # start from r
+        gamma.pow_(2).sub_(1).div_(2 - N)  # (1 - r^2)/(N - 2)
+        torch.sqrt(gamma, out=gamma)  # SE(r)
+        gamma.div_(ph_std)            # adjust SE for phenotype scaling
+        gamma.div_(geno_std)          # adjust SE for SNP scaling
+
+        # Null-model calibration
         gamma.div_(sqrt_c2.unsqueeze(0))
+
         beta_coeffs = beta.cpu()
         se = gamma.cpu()
         t_stats = beta.div_(gamma).abs_().neg_().cpu()
@@ -52,37 +76,39 @@ def run_gwas(runner, snps_per_chunk=1000, device='cuda'):
     if c2_values is None:
         return
     
-    # Get phenotypes and covariates from runner
-    phenotypes = torch.from_numpy(runner.get_phenotypes()).float()
-    covariates = torch.from_numpy(runner.get_covariates()).float()
+    # Get corrected residuals from runner SHOULD GET CORRECTED SCALED RESIDUALS
+    corrected_res = torch.from_numpy(runner.get_phenotypes()).float()
+    #intercept = torch.from_numpy(runner.get_covariates()).float()
     
     if device == 'cuda' and torch.cuda.is_available():
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
     
-    phenotypes = phenotypes.to(device)
-    covariates = covariates.to(device)
+    corrected_res = corrected_res.to(device)
+    #covariates = covariates.to(device)
     
-    n_samples, n_phenotypes = phenotypes.shape
+    n_samples, n_corrected_res = corrected_res.shape
     
     # Center phenotypes with NaN-safe mean and replace NaNs
-    ph_mean = torch.nanmean(phenotypes, dim=0, keepdim=True)
-    phenotypes = phenotypes - ph_mean
-    phenotypes = torch.nan_to_num(phenotypes, nan=0.0)
+    #ph_mean = torch.nanmean(phenotypes, dim=0, keepdim=True)
+    #phenotypes = phenotypes - ph_mean
+    corrected_res = torch.nan_to_num(corrected_res, nan=0.0)
     
-    c = covariates.cpu().numpy()
-    c_mean = np.nanmean(c, axis=0, keepdims=True)
-    c_std = np.nanstd(c, axis=0, keepdims=True)
-    c_std[c_std < 1e-12] = 1.0
-    c = (c - c_mean) / c_std
-    c = np.nan_to_num(c, nan=0.0)
-    covarQ, _ = np.linalg.qr(c)
-    covarQ = torch.from_numpy(covarQ).float().to(device)
+    #c = covariates.cpu().numpy()
+    #c_mean = np.nanmean(c, axis=0, keepdims=True)
+    #c_std = np.nanstd(c, axis=0, keepdims=True)
+    #c_std[c_std < 1e-12] = 1.0
+    #c = (c - c_mean) / c_std
+    #c = np.nan_to_num(c, nan=0.0)
+    #covarQ, _ = np.linalg.qr(c)
+    #covarQ = torch.from_numpy(covarQ).float().to(device)
     
-    pheno_normalized = phenotypes - torch.matmul(covarQ, torch.matmul(covarQ.T, phenotypes))
-    pheno_normalized = pheno_normalized / torch.std(pheno_normalized, dim=0, keepdim=True)
-    pheno_normalized = torch.nan_to_num(pheno_normalized, nan=0.0)
+    #pheno_normalized = phenotypes - torch.matmul(covarQ, torch.matmul(covarQ.T, phenotypes))
+    # Save phenotype std BEFORE normalization for scaling beta/gamma
+    ph_std_pre = torch.std(corrected_res, dim=0, keepdim=True, unbiased=False).clamp_min(1e-8)
+    corrected_res = corrected_res / ph_std_pre
+    corrected_res = torch.nan_to_num(corrected_res, nan=0.0)
     
     # Precompute sqrt(c2) once on the target device (clamped for stability)
     sqrt_c2 = torch.from_numpy(np.asarray(c2_values)).to(device=device, dtype=torch.float32)
@@ -97,8 +123,8 @@ def run_gwas(runner, snps_per_chunk=1000, device='cuda'):
     
     # Preallocate device buffers and reuse/slice for smaller final chunks
     geno_tensor = torch.empty(snps_per_chunk, n_samples, device=device)
-    beta_tensor = torch.empty(snps_per_chunk, n_phenotypes, device=device)
-    gamma_tensor = torch.empty(snps_per_chunk, n_phenotypes, device=device)
+    beta_tensor = torch.empty(snps_per_chunk, n_corrected_res, device=device)
+    gamma_tensor = torch.empty(snps_per_chunk, n_corrected_res, device=device)
     
     for chunk_data in tqdm(queue, desc="Processing SNPs"):
             
@@ -114,7 +140,7 @@ def run_gwas(runner, snps_per_chunk=1000, device='cuda'):
             gamma = gamma_tensor[:actual_snps, :]
         
         geno.copy_(chunk_data)
-        t_stats, beta_coeffs, se = calc_t(pheno_normalized, geno, beta, gamma, sqrt_c2)
+        t_stats, beta_coeffs, se = calc_t(corrected_res, geno, beta, gamma, sqrt_c2, ph_std_pre)
         
         all_t_stats.append(t_stats)
         all_beta.append(beta_coeffs)
