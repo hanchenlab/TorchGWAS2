@@ -77,21 +77,22 @@ def calc_t(corrected_res, geno, beta, gamma, sqrt_c2, ph_std):
 
         # As requested: additionally scale beta by phenotype and SNP stds
         # beta: (M,P) / (1,P) / (M,1) -> (M,P)
-        beta.div_(ph_std)
+        beta.mul_(ph_std)
         beta.div_(geno_std)
 
         # Compute SE from r, then scale SE by the same stds
         gamma.copy_(r)                # start from r
         gamma.pow_(2).sub_(1).div_(2 - N)  # (1 - r^2)/(N - 2)
         torch.sqrt(gamma, out=gamma)  # SE(r)
-        gamma.div_(ph_std)            # adjust SE for phenotype scaling
+        gamma.mul_(ph_std)            # adjust SE for phenotype scaling
         gamma.div_(geno_std)          # adjust SE for SNP scaling
 
         # Null-model calibration
         gamma.div_(sqrt_c2.unsqueeze(0))
 
-        beta_coeffs = beta.cpu()
-        se = gamma.cpu()
+        # Extract final beta and SE BEFORE computing t-stats
+        beta_coeffs = beta.clone().cpu()
+        se = gamma.clone().cpu()
         t_stats = beta.div_(gamma).abs_().neg_().cpu()
         return geno_mean, geno_std, t_stats, beta_coeffs, se
 
@@ -113,7 +114,8 @@ def run_gwas(runner, snps_per_chunk=1000, device='cuda',  compress=False):
     #     return
     
     # Get corrected residuals from runner SHOULD GET CORRECTED SCALED RESIDUALS
-    ph_headers, c2_values, corrected_res = read_correction_file("outexample.txt") # read corrected_res, c2 and ph_headers from file
+    #ph_headers, c2_values, corrected_res = read_correction_file("outAddlie.txt") # read corrected_res, c2 and ph_headers from file
+    ph_headers, c2_values, corrected_res = read_correction_file("test_output.txt") # read corrected_res, c2 and ph_headers from file
     # corrected_res = torch.from_numpy(runner.get_phenotypes()).float()
 
     #intercept = torch.from_numpy(runner.get_covariates()).float()
