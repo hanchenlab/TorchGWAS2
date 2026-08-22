@@ -15,6 +15,7 @@ struct GEMOptions
     bool do_filters = false;
     bool use_sample_file = false;
     std::string includeVariantFile = "";
+    double maf = 0.001;
     int stream_snps = 1;
     std::string sampleid_header_name;
     std::string random_slope_header_name = "";

@@ -1,0 +1,61 @@
+# Conda environment for building and running TorchGWAS2.
+#
+#   conda env create -f environment.yml
+#   conda activate torchgwas2
+#   mkdir build && cd build
+#   cmake ..
+#   make -j$(nproc)
+#
+# CMakeLists.txt auto-detects the active conda environment ($CONDA_PREFIX)
+# and searches it first for Boost, Eigen, Armadillo, SuiteSparse, MKL, and
+# GMP/MPFR, so no extra -D flags are needed.
+#
+# PyTorch is installed via pip from the official CUDA 12.1 wheel index
+# (same recipe the Dockerfile uses), NOT the `pytorch`/`pytorch-cuda` conda
+# packages. The conda-channel `pytorch==2.0.1` build pins an old `mkl`
+# version; pairing it with a current `mkl` (needed for the C++ build below)
+# either fails to solve a CUDA build at all (silently falls back to a
+# CPU-only build) or crashes on import with
+# "undefined symbol: iJIT_NotifyEvent". The pip wheel is self-contained and
+# has no such conflict. `mkl`/`mkl-devel` here are only for the C++ Mygen
+# module (BLAS/LAPACK), not for PyTorch.
+#
+# GPU note: the pip install below pulls the CUDA 12.1 build by default. If
+# you don't have an NVIDIA GPU, swap the --index-url for the CPU-only one
+# in the comment below it.
+
+name: torchgwas2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cmake>=3.14
+  - make
+  - gxx=13
+  - gcc=13
+  - boost>=1.74
+  - eigen=3.4
+  - armadillo
+  - suitesparse
+  - gmp
+  - mpfr
+  - mkl=2023.2.0
+  - mkl-devel=2023.2.0
+  - pkg-config
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - duckdb
+  - pyarrow
+  - tqdm
+  - pip:
+    - --index-url https://download.pytorch.org/whl/cu121
+    - torch
+    - torchvision
+    - torchaudio
+
+# ---------------------------------------------------------------------------
+# CPU-only alternative: replace the --index-url above with
+#   https://download.pytorch.org/whl/cpu
+# ---------------------------------------------------------------------------

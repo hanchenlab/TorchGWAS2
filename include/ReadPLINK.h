@@ -108,4 +108,5 @@ void calc_dosage_plink(std::string const& plinkFile,
                       Plink& plink,
                       BoundedChunkQueue& queue,
                       int threads,
-                      int snps_per_chunk);
+                      int snps_per_chunk,
+                      double maf = 0.001);

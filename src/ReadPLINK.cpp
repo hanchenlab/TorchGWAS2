@@ -594,8 +594,11 @@ void calc_dosage_plink(std::string const& plinkFile,
                       Plink& plink,
                       BoundedChunkQueue& queue,
                       int threads,
-                      int snps_per_chunk)
+                      int snps_per_chunk,
+                      double maf)
 {
+    const double MAF = maf;
+    const double maxMAF = 1 - MAF;
     // Partition variants into per-thread blocks
     plink.get_variant_positions(threads, plink.includeVariantFile, plink.filterVariants);
 
@@ -635,18 +638,18 @@ void calc_dosage_plink(std::string const& plinkFile,
                 Chunk chunk_data;
                 chunk_data.data = std::shared_ptr<float>(
                     new float[chunk_size * sam_size](), std::default_delete<float[]>());
-                chunk_data.rsid.resize(chunk_size);
-                chunk_data.snpid.resize(chunk_size);
-                chunk_data.chr.resize(chunk_size);
-                chunk_data.pos.resize(chunk_size);
-                chunk_data.allele0.resize(chunk_size);
-                chunk_data.allele1.resize(chunk_size);
-                chunk_data.n_samples.resize(chunk_size);
-                chunk_data.af.resize(chunk_size, 0.0f);
-                chunk_data.gv.resize(chunk_size, 0.0f);
-                chunk_data.rows = chunk_size;
+                chunk_data.rsid.reserve(chunk_size);
+                chunk_data.snpid.reserve(chunk_size);
+                chunk_data.chr.reserve(chunk_size);
+                chunk_data.pos.reserve(chunk_size);
+                chunk_data.allele0.reserve(chunk_size);
+                chunk_data.allele1.reserve(chunk_size);
+                chunk_data.n_samples.reserve(chunk_size);
+                chunk_data.af.reserve(chunk_size);
+                chunk_data.gv.reserve(chunk_size);
                 chunk_data.cols = sam_size;
 
+                int kept = 0;
                 for (int local_idx = 0; local_idx < chunk_size; ++local_idx) {
                     uint32_t variant_idx = plink.include_idx[chunk_start + local_idx];
 
@@ -659,7 +662,9 @@ void calc_dosage_plink(std::string const& plinkFile,
                         throw std::runtime_error(fmt::format(
                             "fread failed for variant {}", variant_idx));
 
-                    float* out_row = chunk_data.data.get() + local_idx * sam_size;
+                    // Write into the next output row; overwritten in place if this
+                    // variant fails the MAF filter below.
+                    float* out_row = chunk_data.data.get() + kept * sam_size;
                     for (int j = 0; j < sam_size; ++j) out_row[j] = -9.0f;
 
                     float sum = 0.0f, sq_sum = 0.0f;
@@ -681,21 +686,30 @@ void calc_dosage_plink(std::string const& plinkFile,
                         }
                     }
 
+                    float af = 0.0f, gv = 0.0f;
                     if (n_valid > 0) {
                         float mean = sum / n_valid;
-                        chunk_data.af[local_idx] = mean / 2.0f;
-                        chunk_data.gv[local_idx] = sq_sum / n_valid - mean * mean;
+                        af = mean / 2.0f;
+                        gv = sq_sum / n_valid - mean * mean;
                     }
 
-                    chunk_data.rsid[local_idx]      = plink.variant_ids[variant_idx];
-                    chunk_data.snpid[local_idx]     = plink.variant_ids[variant_idx];
-                    chunk_data.chr[local_idx]       = plink.chromosome[variant_idx];
-                    chunk_data.pos[local_idx]       = std::to_string(plink.base_pair_pos[variant_idx]);
-                    chunk_data.allele0[local_idx]   = plink.allele_alt[variant_idx];
-                    chunk_data.allele1[local_idx]   = plink.allele_ref[variant_idx];
-                    chunk_data.n_samples[local_idx] = std::to_string(n_valid);
+                    if (af < MAF || af > maxMAF) continue;
+
+                    chunk_data.rsid.push_back(plink.variant_ids[variant_idx]);
+                    chunk_data.snpid.push_back(plink.variant_ids[variant_idx]);
+                    chunk_data.chr.push_back(plink.chromosome[variant_idx]);
+                    chunk_data.pos.push_back(std::to_string(plink.base_pair_pos[variant_idx]));
+                    chunk_data.allele0.push_back(plink.allele_alt[variant_idx]);
+                    chunk_data.allele1.push_back(plink.allele_ref[variant_idx]);
+                    chunk_data.n_samples.push_back(std::to_string(n_valid));
+                    chunk_data.af.push_back(af);
+                    chunk_data.gv.push_back(gv);
+                    ++kept;
                 }
 
+                if (kept == 0) continue;
+
+                chunk_data.rows = kept;
                 queue.push(std::move(chunk_data));
             }
 

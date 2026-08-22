@@ -95,8 +95,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run TorchGWAS using GEM2 and Torch backend.")
     parser.add_argument("--pheno-file", type=str, help="Phenotype file path (required for step1)")
     parser.add_argument("--cov-file", type=str, help="Covariate file path (required for step1 and step2)")
-    parser.add_argument("--bgen", nargs="+", default=[], help="Step2: BGEN file(s).")
-    parser.add_argument("--sample", nargs="+", default=[], help="Step2: SAMPLE file(s).")
+    parser.add_argument("--bgen", nargs="+", default=[], help="Step2: BGEN file(s). Mutually exclusive with --bed/--pgen.")
+    parser.add_argument("--bed", nargs="+", default=[], help="Step2: PLINK BED file prefix(es), PLINK --bfile style "
+                        "(no extension) -- e.g. --bed example looks for example.bed, example.bim, and example.fam. "
+                        "--sample is not required for BED input (pass it only to override the auto-detected .fam). "
+                        "Mutually exclusive with --bgen/--pgen.")
+    parser.add_argument("--pgen", nargs="+", default=[], help="Step2: PLINK 2 PGEN file prefix(es), PLINK --pfile "
+                        "style (no extension) -- e.g. --pgen example looks for example.pgen, example.pvar, and "
+                        "example.psam. NOT YET SUPPORTED by the backend (Plink::process_plink_header_block only "
+                        "accepts .bed) -- reading a .pgen file currently fails with a clear error at runtime. "
+                        "Mutually exclusive with --bgen/--bed.")
+    parser.add_argument("--sample", nargs="+", default=[], help="Step2: SAMPLE file(s). Required, one per file, "
+                        "when using --bgen. Optional (and ignored unless supplied) when using --bed/--pgen.")
     parser.add_argument("--kin-file", type=str, default="", help="Kinship file path (optional, required for step1 and step2 if using kinship)")
     parser.add_argument("--kin-diag", type=float, default=1.0, help="Diagonal value of " \
                         "kinship matrix that not accounting for inbreeding (Default: 1.0)")
@@ -109,6 +119,8 @@ def parse_args():
                         the specified genotype file to be used for analysis. The first line in this file is the header that specifies\
                         which variant identifier in the genotype file is used for ID matching. This must be 'snpid' (PLINK or BGEN)\
                         or 'rsid' (BGEN only). There should be one variantidentifier per line after the header.")
+    parser.add_argument("--maf", type=float, default=0.001, help="Minimum minor allele frequency threshold; \
+                        variants with MAF below this value are excluded (default: 0.001)")
     parser.add_argument("--covar-names", nargs="+", help="Covariate names list")
     parser.add_argument("--random-slope-name", type=str, default = "", help="Column name in the covariate file that contains random slope (default: "").")
     parser.add_argument("--missing-value", type=str, default="NA", help="Indicates how missing values in the phenotype and covariate files are stored.")
@@ -177,6 +189,41 @@ def validate_args(args):
             logging.error("--kin-delim or --kin-diag cannot be used without --kin-file.")
             raise SystemExit(2)
 
+def resolve_geno_input(args):
+    """
+    Reconcile --bgen/--bed/--pgen/--sample into the single genotype-file list
+    the rest of the pipeline consumes via args.bgen.
+
+    --bgen, --bed, and --pgen are mutually exclusive. --bed/--pgen take a
+    PLINK --bfile/--pfile-style prefix (no extension): "example" resolves to
+    example.bed or example.pgen, with the companion .bim/.fam or .pvar/.psam
+    auto-detected alongside it, so --sample is optional for --bed/--pgen
+    (only needed to override the auto-detected sample file); --sample stays
+    required for --bgen (validated downstream, unchanged).
+
+    NOTE: --pgen is CLI plumbing only -- the backend (Plink::process_
+    plink_header_block) only accepts .bed today, so a --pgen run fails at
+    runtime with a clear "Only .bed is supported" error until PGEN reading
+    is actually implemented.
+    """
+    given = [flag for flag, vals in (("--bgen", args.bgen), ("--bed", args.bed), ("--pgen", args.pgen)) if vals]
+    if len(given) > 1:
+        logging.error(f"{', '.join(given)} are mutually exclusive; specify only one.")
+        raise SystemExit(2)
+
+    args.using_bed = bool(args.bed)
+    args.using_pgen = bool(args.pgen)
+    args.geno_flag = "--bed" if args.using_bed else "--pgen" if args.using_pgen else "--bgen"
+
+    if args.using_bed:
+        args.bgen = [prefix + ".bed" for prefix in args.bed]
+        if not args.sample:
+            args.sample = [""] * len(args.bgen)
+    elif args.using_pgen:
+        args.bgen = [prefix + ".pgen" for prefix in args.pgen]
+        if not args.sample:
+            args.sample = [""] * len(args.bgen)
+
 # def open_intermediate_file(int_path, mode="w"):
 #     try:
 #         dir_name = os.path.dirname(int_path)
@@ -203,6 +250,7 @@ def build_conf_allsteps(args):
         use_sample_file=bool(args.sample),
         do_filters=bool(args.include_snp_file),
         includeVariantFile=args.include_snp_file,
+        maf=args.maf,
         stream_snps=args.stream_snps,
         sampleid_header_name=args.sampleid_name,
         covariates=args.covar_names,
@@ -230,6 +278,7 @@ def build_conf_step1(args):
         use_sample_file=bool(args.sample),
         do_filters=bool(args.include_snp_file),
         includeVariantFile=args.include_snp_file,
+        maf=args.maf,
         stream_snps=args.stream_snps,
         sampleid_header_name=args.sampleid_name,
         covariates=args.covar_names,
@@ -258,6 +307,7 @@ def build_conf_step2(args):
         use_sample_file=bool(args.sample),
         do_filters=bool(args.include_snp_file),
         includeVariantFile=args.include_snp_file,
+        maf=args.maf,
         stream_snps=args.stream_snps,
         sampleid_header_name=args.sampleid_name,
         covariates=args.covar_names,
@@ -427,7 +477,8 @@ def main():
     global _TEE
     start_time = time.time()
     args = parse_args()
-    
+    resolve_geno_input(args)
+
     crash_fp = open_crash_log(args.log)
     faulthandler.enable(file=crash_fp, all_threads=True)
     crash_fp.write("\n==== log start ====\n")
@@ -454,7 +505,7 @@ def main():
                 logging.error("STEP 1 requires --pheno-file.")
                 raise SystemExit(2)
             if len(args.bgen) != 1:
-                logging.error("STEP 1 requires exactly ONE --bgen file.")
+                logging.error(f"STEP 1 requires exactly ONE {args.geno_flag} file.")
                 raise SystemExit(2)
             if len(args.sample) != 1:
                 logging.error("STEP 1 requires exactly ONE --sample file.")
@@ -474,7 +525,7 @@ def main():
             if args.null_log != "null_log.log":
                 print("WARNING: --null-log is only used with --step step1. Ignoring it for --step step2.", file=sys.stderr)
             if len(args.bgen) != len(args.sample):
-                print(f"--bgen count ({len(args.bgen)}) must match --sample count ({len(args.sample)}).")
+                print(f"{args.geno_flag} count ({len(args.bgen)}) must match --sample count ({len(args.sample)}).")
                 raise SystemExit(2)
             
             # Reset peak memory once before the whole step2 batch so we can

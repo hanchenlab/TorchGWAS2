@@ -55,7 +55,7 @@ class Bgen
 // void gemBGEN(int thread_num, double sigma2, double* resid, double* XinvXTX, vector<double> miu, BinE binE, Bgen bgen, CommandLine cmd);
 void bgen13_get_two_vals(const unsigned char* prob_start, uint32_t bit_precision, uintptr_t offset, uintptr_t* first_val_ptr, uintptr_t* second_val_ptr);
 
-void calc_dosage(std::string const& bgenFile, Bgen &bgen, BoundedChunkQueue& queue, int threads, int snps_per_chunk);
+void calc_dosage(std::string const& bgenFile, Bgen &bgen, BoundedChunkQueue& queue, int threads, int snps_per_chunk, double maf = 0.001);
 // void calc_dosage(const std::string& bgenFile, Bgen &bgen, BoundedChunkQueue& queue, int snps_per_chunk);
 
 void Read_bgen_file(std::string const& bgenFile, Bgen bgen, int thread_num, int stream_snps, std::string outFile);

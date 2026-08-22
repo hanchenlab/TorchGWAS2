@@ -1,4 +1,4 @@
-#docker build --build-arg BASE_IMAGE=nvidia/cuda:12.6.0-runtime-ubuntu24.04 -t tgwas:cuda12.6 .
+#docker build --build-arg BASE_IMAGE=nvidia/cuda:12.4.0-runtime-ubuntu22.04 -t torchgwas2:test .
 
 ARG BASE_IMAGE=nvidia/cuda:12.4.0-runtime-ubuntu22.04
 # Stage 1 Use Ubuntu 22.04 as base

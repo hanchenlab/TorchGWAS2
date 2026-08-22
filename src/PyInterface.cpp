@@ -46,6 +46,7 @@ PYBIND11_MODULE(Mygen, m)
         .def_readwrite("do_filters", &GEMOptions::do_filters)
         .def_readwrite("use_sample_file",  &GEMOptions::use_sample_file)
         .def_readwrite("includeVariantFile", &GEMOptions::includeVariantFile)
+        .def_readwrite("maf", &GEMOptions::maf)
         .def_readwrite("stream_snps",  &GEMOptions::stream_snps)
         .def_readwrite("sampleid_header_name", &GEMOptions::sampleid_header_name)
         .def_readwrite("random_slope_header_name", &GEMOptions::random_slope_header_name)
@@ -84,20 +85,21 @@ PYBIND11_MODULE(Mygen, m)
                     auto q = std::make_shared<BoundedChunkQueue>(queue_capacity);
                     auto geno_file = self.opt.geno_add;
                     auto threads = self.opt.threads;
+                    auto maf = self.opt.maf;
                     auto genofile_type = self.genofile_type;
 
                     // Branch based on genotype file format
                     if (genofile_type == "BGEN") {
                         // BGEN format - use existing calc_dosage
                         auto bgen_copy = self.bgen; // shallow copy; calc_dosage opens its own FILE handles
-                        std::thread([q, bgen_copy, geno_file, threads, snps_per_chunk]() mutable {
-                            calc_dosage(geno_file, bgen_copy, *q, threads, snps_per_chunk);
+                        std::thread([q, bgen_copy, geno_file, threads, snps_per_chunk, maf]() mutable {
+                            calc_dosage(geno_file, bgen_copy, *q, threads, snps_per_chunk, maf);
                         }).detach();
                     } else if (genofile_type == "BED" || genofile_type == "PGEN") {
                         // PLINK format - use calc_dosage_plink
                         auto plink_sptr = self.plink_sptr;
-                        std::thread([q, plink_sptr, geno_file, threads, snps_per_chunk]() mutable {
-                            calc_dosage_plink(geno_file, *plink_sptr, *q, threads, snps_per_chunk);
+                        std::thread([q, plink_sptr, geno_file, threads, snps_per_chunk, maf]() mutable {
+                            calc_dosage_plink(geno_file, *plink_sptr, *q, threads, snps_per_chunk, maf);
                         }).detach();
                     } else {
                         throw std::runtime_error("Unsupported genotype file format: " + genofile_type);
@@ -113,20 +115,21 @@ PYBIND11_MODULE(Mygen, m)
                     auto q = std::make_shared<BoundedChunkQueue>(queue_capacity);
                     auto geno_file = self.opt.geno_add;
                     auto threads = self.opt.threads;
+                    auto maf = self.opt.maf;
                     auto genofile_type = self.genofile_type;
 
                     // Branch based on genotype file format
                     if (genofile_type == "BGEN") {
                         // BGEN format - use existing calc_dosage
                         auto bgen_copy = self.bgen;
-                        std::thread([q, bgen_copy, geno_file, threads, snps_per_chunk]() mutable {
-                            calc_dosage(geno_file, bgen_copy, *q, threads, snps_per_chunk);
+                        std::thread([q, bgen_copy, geno_file, threads, snps_per_chunk, maf]() mutable {
+                            calc_dosage(geno_file, bgen_copy, *q, threads, snps_per_chunk, maf);
                         }).detach();
                     } else if (genofile_type == "BED" || genofile_type == "PGEN") {
                         // PLINK format - use calc_dosage_plink
                         auto plink_sptr = self.plink_sptr;
-                        std::thread([q, plink_sptr, geno_file, threads, snps_per_chunk]() mutable {
-                            calc_dosage_plink(geno_file, *plink_sptr, *q, threads, snps_per_chunk);
+                        std::thread([q, plink_sptr, geno_file, threads, snps_per_chunk, maf]() mutable {
+                            calc_dosage_plink(geno_file, *plink_sptr, *q, threads, snps_per_chunk, maf);
                         }).detach();
                     } else {
                         throw std::runtime_error("Unsupported genotype file format: " + genofile_type);

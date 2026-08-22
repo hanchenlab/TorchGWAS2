@@ -195,7 +195,7 @@ void Bgen::process_bgen_header_block(std::string bgenfile)
  */
 
 
-void calc_dosage(const std::string& bgenFile, Bgen &bgen, BoundedChunkQueue& queue,  int threads, int snps_per_chunk)
+void calc_dosage(const std::string& bgenFile, Bgen &bgen, BoundedChunkQueue& queue,  int threads, int snps_per_chunk, double maf)
 {
     const int sam_size = bgen.new_samSize;
     if (snps_per_chunk <= 0) snps_per_chunk = 1000;
@@ -227,8 +227,8 @@ void calc_dosage(const std::string& bgenFile, Bgen &bgen, BoundedChunkQueue& que
     for (int w = 0; w < n_workers; ++w) {
         workers.emplace_back([&, w]
         {
-            double MAF = 0.001;
-            double maxMAF = 1 - MAF;
+            const double MAF = maf;
+            const double maxMAF = 1 - MAF;
             // auto start_time = std::chrono::high_resolution_clock::now();
 
             const uint Nbgen  = bgen.Nbgen;
