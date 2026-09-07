@@ -53,6 +53,9 @@ docker run --rm \
 
 Drop `--gpus all` and pass `--device cpu` to run without a GPU. See [OPTIONS.md](OPTIONS.md) for the full option list, BED input, MAF filtering, kinship, and pipeline steps (`--step step1`/`step2`/`step3`).
 
+## Previous work
+Please see our previous work [TorchGWAS](https://github.com/ZhiGroup/TorchGWAS) and the accompanying article: [TorchGWAS : GPU-accelerated GWAS for thousands of quantitative phenotypes](https://arxiv.org/abs/2604.21095)
+
 ## License
 
 TorchGWAS2 is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`).
