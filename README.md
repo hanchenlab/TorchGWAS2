@@ -1,6 +1,6 @@
 # TorchGWAS2
 
-A GPU-accelerated genome-wide association study (GWAS) tool. TorchGWAS2 fits a linear mixed null model on CPU (C++ / Intel MKL / SuiteSparse), then streams genotype dosages and tests each variant for association on GPU or CPU (PyTorch).
+A GPU-accelerated genome-wide association study (GWAS) tool ([Preprint](https://www.medrxiv.org/content/10.64898/2026.09.10.26362744v1)). TorchGWAS2 fits a linear mixed null model on CPU (C++ / Intel MKL / SuiteSparse), then streams genotype dosages and tests each variant for association on GPU or CPU (PyTorch).
 
 ## Features
 
