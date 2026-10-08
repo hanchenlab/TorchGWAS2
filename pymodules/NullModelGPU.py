@@ -140,6 +140,9 @@ def read_step1_inputs(args, pheno_delim, cov_delim):
     # pyarrow parses on several threads and rounds each value correctly, as std::stod does.
     import pyarrow as pa
     import pyarrow.csv as pacsv
+    threads = getattr(args, 'threads', None) or len(os.sched_getaffinity(0))
+    if pa.cpu_count() < threads:      # its pool follows OMP_NUM_THREADS, which the image sets to 1
+        pa.set_cpu_count(threads)
     id_cols = set(pheno_header[:2] + [id_col])
     pheno = pacsv.read_csv(args.pheno_file, parse_options=pacsv.ParseOptions(delimiter=pheno_delim),
                            convert_options=pacsv.ConvertOptions(
