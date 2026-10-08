@@ -4,7 +4,7 @@ A GPU-accelerated genome-wide association study (GWAS) tool ([Preprint](https://
 
 ## Features
 
-- **Null model fitting** — CPU, mixed-model, optional kinship/relatedness correction
+- **Null model fitting** — CPU, or GPU with `--null-device cuda`; mixed-model, optional kinship/relatedness correction
 - **Association testing** — GPU (CUDA) or CPU, multiple phenotypes in one pass
 - **Genotype formats** — BGEN, and PLINK 1.x BED/BIM/FAM
 - **Streaming I/O** — genotypes are read and tested in chunks, not loaded whole into memory

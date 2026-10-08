@@ -130,6 +130,11 @@ def parse_args():
     parser.add_argument("--log", type=str, default="log.log", help="log file path")
     parser.add_argument("--null-log", type=str, default="null_log.log", help="Crash log file")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda", help="Computation device (default: cuda)")
+    parser.add_argument("--null-device", choices=["cpu", "cuda"], default="cpu",
+                        help="Device for step 1, the null model (default: cpu). cuda fits every phenotype "
+                             "together on the GPU (pymodules/NullModelGPU.py) and writes the same correction "
+                             "file; binary phenotypes not coded 0/1, repeated measures and random slopes "
+                             "still use the CPU.")
     parser.add_argument("--verbose", action="store_true", help="Print null model(default: False)")
     parser.add_argument("--convert", action="store_true", help="Convert binary to text file (default: True)")
     parser.add_argument("--step", choices=["all", "step1", "step2", "step3"], default="all",
@@ -324,6 +329,18 @@ def build_conf_step2(args):
     )
     return confopt
 
+def fit_null_model_step1(args, confopt):
+    """Step 1: on the GPU with --null-device cuda when the GPU null model covers the case, else the C++ step 1."""
+    if args.null_device == "cuda":
+        from pymodules.NullModelGPU import fit_step1_gpu
+        reason = fit_step1_gpu(args, normalize_delim(args.pheno_delim), normalize_delim(args.cov_delim),
+                               normalize_delim(args.kin_delim), log=logging.info)
+        if reason is None:
+            return
+        logging.info("GPU null model not used (%s); fitting the null model on the CPU.", reason)
+    GEMRunner(confopt.get()).run_fit_nullmodel()
+
+
 def run_all(dir_name, base_name, args, log_file):
     # ------------------
     # STEP 1 (once)
@@ -335,10 +352,9 @@ def run_all(dir_name, base_name, args, log_file):
     sub_step1.bgen = args.bgen[0]
     sub_step1.sample = args.sample[0]
     conf_step1 = build_conf_step1(sub_step1)
-    runner = GEMRunner(conf_step1.get())     
     corr_file = args.corr_file
     #Null model
-    runner.run_fit_nullmodel()
+    fit_null_model_step1(sub_step1, conf_step1)
     logging.info("correction file (correction) path: %s", corr_file)
     setup_pipeline_log(log_file, mode="a")
     # ------------------
@@ -420,11 +436,8 @@ def run_step1(confopt, dir_name, base_name, args):
       -run_gwas(runner, correction, TGWAS_file, ...)
     """
     corr_file = args.corr_file
-    # 1) C++ init
-    runner = GEMRunner(confopt.get())
-
-    # 2) Null model
-    runner.run_fit_nullmodel()
+    # Null model (C++, or the GPU with --null-device cuda)
+    fit_null_model_step1(args, confopt)
 
     logging.info("correction file (correction) path: %s", corr_file)
 
