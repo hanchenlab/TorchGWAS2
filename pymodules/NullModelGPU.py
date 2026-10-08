@@ -259,8 +259,111 @@ def read_kinship(path, delim, ids, diagonal):
 
 
 # ---------------------------------------------------------------------------
-# The kinship's families
+# The kinship's families: connected components of the related pairs
 # ---------------------------------------------------------------------------
+#
+# Each sample is labelled with its component's smallest index. Two
+# implementations, the same labels:
+#
+# union-find (native/union_find.cu, built ahead of time by
+# native/compile_union_find.sh for sm_75 to sm_120 plus compute_75 PTX): ECL-CC
+# style. One thread per pair finds the roots of both samples and hooks the
+# larger root under the smaller with an atomic compare-and-swap, retrying from
+# the root's new parent when it loses a race; a final pass points every sample
+# at its root. A root is only ever hooked under a smaller index, so the
+# component's smallest sample is never hooked and is the root everyone ends at,
+# whatever order the threads run in.
+#
+# hook-to-root (Torch, any device): Shiloach-Vishkin. Each round every pair
+# whose samples have different roots hooks the larger root under the smaller
+# (scatter amin on the roots), then pointer jumping (label[label]) takes every
+# sample to its root.
+#
+# component_labels() runs the union-find on any GPU it launches on, otherwise
+# hook-to-root. On the UK Biobank relatedness file (147,716 samples, 107,149
+# pairs; an A100) hook-to-root takes 3.9 ms in 3 rounds.
+
+_UNION_FIND = None
+_UNION_FIND_LAUNCHES = {}      # device index -> whether the union-find runs there
+
+
+def _union_find_library():
+    global _UNION_FIND
+    if _UNION_FIND is None:
+        import ctypes as ct
+        library = ct.CDLL(str(Path(__file__).with_name('native') / 'libunion_find.so'))
+        library.tg_union_find.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_int64, ct.c_void_p, ct.c_int64, ct.c_void_p]
+        library.tg_union_find.restype = ct.c_int
+        library.tg_union_find_error.restype = ct.c_char_p
+        _UNION_FIND = library
+    return _UNION_FIND
+
+
+def union_find(rows, cols, n):
+    """The native union-find's labels for pairs rows[k]-cols[k] (CUDA tensors), int64."""
+    library = _union_find_library()
+    device = rows.device
+    parent = torch.arange(n, dtype=torch.int32, device=device)
+    if rows.numel():
+        rows32 = rows.to(torch.int32).contiguous()
+        cols32 = cols.to(torch.int32).contiguous()
+        with torch.cuda.device(device):
+            stream = torch.cuda.current_stream(device).cuda_stream
+            if library.tg_union_find(rows32.data_ptr(), cols32.data_ptr(), rows32.numel(), parent.data_ptr(), n,
+                                     stream):
+                raise RuntimeError(library.tg_union_find_error().decode())
+    return parent.to(torch.int64)
+
+
+def union_find_available(device):
+    """Whether the union-find runs on `device`, found once per GPU by labelling a small graph.
+
+    Loading the library is not enough: on a GPU the build has no code for, the
+    failure comes only at launch.
+    """
+    device = torch.device(device)
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return False
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if index not in _UNION_FIND_LAUNCHES:
+        try:
+            on = torch.device('cuda', index)
+            labels = union_find(torch.tensor([1, 3], device=on), torch.tensor([2, 1], device=on), 5)
+            _UNION_FIND_LAUNCHES[index] = labels.tolist() == [0, 1, 1, 1, 4]
+        except (OSError, RuntimeError):
+            _UNION_FIND_LAUNCHES[index] = False
+    return _UNION_FIND_LAUNCHES[index]
+
+
+def hook_to_root(rows, cols, n):
+    """Shiloach-Vishkin labels and the number of hooking rounds."""
+    label = torch.arange(n, device=rows.device)
+    rounds = 0
+    while rows.numel():
+        lu, lv = label[rows], label[cols]
+        differ = lu != lv
+        if not bool(differ.any()):
+            break
+        rounds += 1
+        # Every label is a root here, so this hooks roots, each under the smallest offered.
+        label = label.scatter_reduce(0, torch.maximum(lu, lv)[differ], torch.minimum(lu, lv)[differ], 'amin')
+        while True:                      # pointer jumping to the roots
+            jumped = label[label]
+            if torch.equal(jumped, label):
+                break
+            label = jumped
+    return label, rounds
+
+
+def component_labels(rows, cols, n, device):
+    """Each sample's component label, its smallest index (int64, on `device`), for pairs rows[k]-cols[k]."""
+    device = torch.device(device)
+    rows = torch.as_tensor(rows, dtype=torch.int64, device=device)
+    cols = torch.as_tensor(cols, dtype=torch.int64, device=device)
+    if union_find_available(device):
+        return union_find(rows, cols, n)
+    return hook_to_root(rows, cols, n)[0]
+
 
 class FamilyTooLarge(ValueError):
     """A kinship family larger than MAX_BLOCK, even after thresholding (relatives_only)."""
@@ -273,22 +376,8 @@ class Kinship:
         self.n, self.diagonal, self.rows, self.cols, self.values = n, diagonal, rows, cols, values
 
     def _family_of(self, device):
-        """Each sample's family number (0 ..), and the family sizes, on `device`.
-
-        Minimum-label propagation over the pairs with pointer jumping: a label
-        is always a sample of its own component no larger than itself, so when
-        no pair changes one, each component carries its smallest index.
-        """
-        rows = torch.as_tensor(self.rows, dtype=torch.int64, device=device)
-        cols = torch.as_tensor(self.cols, dtype=torch.int64, device=device)
-        label = torch.arange(self.n, device=device)
-        while rows.numel():
-            low = torch.minimum(label[rows], label[cols])
-            new = label.scatter_reduce(0, rows, low, 'amin').scatter_reduce_(0, cols, low, 'amin')
-            new = new[new]
-            if torch.equal(new, label):
-                break
-            label = new
+        """Each sample's family number (0 .., in order of smallest member), and the family sizes, on `device`."""
+        label = component_labels(self.rows, self.cols, self.n, device)
         _, family = torch.unique(label, return_inverse=True)
         return family, torch.bincount(family)
 

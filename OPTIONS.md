@@ -28,7 +28,7 @@ or, via Docker, replace `python RunTorchGWAS.py` with `docker run --rm [--gpus a
 
 TorchGWAS2 runs two computational stages:
 
-1. **Null model fitting** (CPU, or GPU with `--null-device cuda`) — fits a linear mixed model on the phenotype/covariate data, optionally accounting for relatedness via a kinship matrix, and writes fitted residuals/correction factors to `--corr-file`.
+1. **Null model fitting** (CPU, or GPU with `--null-device cuda`) — fits a mixed model on the phenotype/covariate data (linear for a quantitative phenotype, logistic for a binary one), optionally accounting for relatedness via a kinship matrix, and writes fitted residuals/correction factors to `--corr-file`.
 2. **Association testing** (GPU or CPU) — streams genotype dosages in chunks and tests each variant against the fitted null model for every phenotype.
 
 ## Pipeline steps (`--step`)
@@ -41,6 +41,8 @@ TorchGWAS2 runs two computational stages:
 | `step3` | Converts one or more `.parquet` files (`--parquet`) from `step2` into tab-separated `.txt`. |
 
 Running `step1` and `step2` separately (instead of `all`) is useful when you want to fit the null model once and then test many genotype files against it without refitting, or to parallelize `step2` across genotype files independently.
+
+With `--null-device cuda`, `all` hands the fitted residuals to association testing in memory, still on the GPU, instead of reading them back from `--corr-file` for every genotype file (the file is still written; the results are identical).
 
 ## Basic options
 
@@ -110,9 +112,9 @@ Sample IDs for BED input are read from the `.fam` file's second column (IID) and
 
 | Option | Argument | Description | Default |
 |---|---|---|---|
-| `--threads` | int | CPU threads for null-model fitting and genotype reading. | number of CPU cores detected |
+| `--threads` | int | CPU threads for null-model fitting and genotype reading (with `--null-device cuda`, also for reading the phenotype file and writing the correction file). | number of CPU cores detected |
 | `--stream-snps` | int | Number of variants streamed per chunk during association testing. Higher values use more memory (and, on GPU, more VRAM) but reduce per-chunk overhead. | `1000` |
-| `--null-device` | `cpu`\|`cuda` | Compute device for null-model fitting (step 1). `cuda` fits all phenotypes together on the GPU (`pymodules/NullModelGPU.py`): the same model, iteration and correction file as the CPU fit (linear for quantitative phenotypes, logistic PQL for binary ones), with values written at full double precision. Binary phenotypes not coded 0/1, repeated measures (duplicated sample IDs) and random slopes are not handled on the GPU and fall back to the CPU fit, with the reason logged. | `cpu` |
+| `--null-device` | `cpu`\|`cuda` | Compute device for null-model fitting (step 1). `cuda` fits all phenotypes together on the GPU (`pymodules/NullModelGPU.py`): the same model, iteration and correction file as the CPU fit (linear for quantitative phenotypes, logistic PQL for binary ones). Its correction file holds c2 at full double precision and each residual as the shortest text that reads back as the same float32, which is what step 2 computes with (the CPU fit prints six significant digits). Binary phenotypes not coded 0/1, repeated measures (duplicated sample IDs) and random slopes are not handled on the GPU and fall back to the CPU fit, with the reason logged. Kinship families are found with a prebuilt GPU union-find (`pymodules/native`), or a PyTorch equivalent where it does not run. | `cpu` |
 | `--device` | `cpu`\|`cuda` | Compute device for association testing. `cuda` requires a working PyTorch CUDA build (see [INSTALL.md](INSTALL.md#-known-pitfall-mkl--pytorch-version-conflicts)) and, for the Docker image, `--gpus all` with the NVIDIA Container Toolkit configured on the host. | `cuda` |
 
 ## Output options
@@ -140,6 +142,7 @@ FID    IID       pheno1    pheno2
 - Column 2's header must match `--sampleid-name`.
 - Missing values use the token given by `--missing-value` (default `NA`).
 - Multiple phenotype columns are tested simultaneously.
+- A phenotype with two distinct (non-missing) values is treated as binary and gets a logistic null model; code it 0/1. Quantitative and binary phenotypes can be mixed in one file.
 
 ### Covariate file
 Same shape as the phenotype file: family ID, individual ID, then covariate columns.

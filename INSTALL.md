@@ -13,7 +13,9 @@ There are three ways to build TorchGWAS2, all driven by the same `CMakeLists.txt
 - Linux, x86_64
 - GCC/G++ 13 (required for the C++20 features used in this project)
 - CMake ≥ 3.14
-- An NVIDIA GPU + driver, if you want `--device cuda` (CPU-only works everywhere)
+- An NVIDIA GPU + driver, if you want `--device cuda` or `--null-device cuda` (CPU-only works everywhere)
+
+GPU null-model fitting (`--null-device cuda`) needs nothing beyond PyTorch: its one compiled piece, the union-find that finds kinship families (`pymodules/native/libunion_find.so`), ships prebuilt for every GPU generation from Turing (sm_75) to Blackwell (sm_120), with PTX that newer GPUs compile on first use, and a PyTorch fallback where it does not run. To rebuild it: `pymodules/native/compile_union_find.sh` (needs `nvcc` 12.8 or newer). The CUDA 12.1 PyTorch wheel used below has no code for Blackwell GPUs (sm_100, sm_120); on those, install a PyTorch built for CUDA 12.8 or newer (e.g. `--index-url https://download.pytorch.org/whl/cu128`).
 
 ---
 
@@ -155,6 +157,16 @@ python RunTorchGWAS.py \
 ```
 
 See [OPTIONS.md](OPTIONS.md) for the complete option reference, BED-format input, MAF filtering, and running the pipeline in separate steps.
+
+## Tests
+
+The GPU null model and the correction-file reader have tests that need only the Python stack (not the C++ module) plus `pytest`:
+
+```bash
+python -m pytest test/test_null_model_gpu.py test/test_read_correction_file.py
+```
+
+They compare the batched GPU fit with dense one-phenotype-at-a-time references of the C++ step 1's algorithm (linear AI-REML and logistic PQL, with and without kinship), the kinship file rules, the union-find against a plain reference, and the reader against its line-by-line predecessor. The fits also run on the CPU; tests that need CUDA are skipped without it.
 
 ## Contact
 

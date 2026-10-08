@@ -298,6 +298,74 @@ def test_quantitative_and_binary_phenotypes_fit_together(device):
                                        alone[key], rtol=1e-10, atol=1e-12)
 
 
+CUDA_UNION_FIND = torch.cuda.is_available() and gpu.union_find_available('cuda')
+
+
+def _labellers():
+    out = [('hook-to-root, cpu', 'cpu', lambda r, c, n: gpu.hook_to_root(r, c, n)[0])]
+    if torch.cuda.is_available():
+        out.append(('hook-to-root, cuda', 'cuda', lambda r, c, n: gpu.hook_to_root(r, c, n)[0]))
+    if CUDA_UNION_FIND:
+        out.append(('union-find, cuda', 'cuda', gpu.union_find))
+    return out
+
+
+def _components_reference(rows, cols, n):
+    """Union-find in Python; each node's label is its component's smallest node."""
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for u, v in zip(rows.tolist(), cols.tolist()):
+        a, b = find(u), find(v)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    return np.array([find(x) for x in range(n)])
+
+
+def _graphs():
+    rng = np.random.default_rng(3)
+    order = rng.permutation(200_000)               # a chain visiting the nodes in random order
+    yield 'long chain', order[:-1], order[1:], 200_000
+    yield 'star', np.full(49_999, 25_000), np.delete(np.arange(50_000), 25_000), 50_000
+    yield 'random', rng.integers(0, 5_000, 4_000), rng.integers(0, 5_000, 4_000), 5_000
+    pairs = [(a + i, a + j) for a in range(0, 3_000, 6) for i in range(6) for j in range(i + 1, 6)
+             if rng.random() < 0.5]
+    yield 'families, both orders and repeats', np.array([p[0] for p in pairs] + [p[1] for p in pairs[:50]]), \
+        np.array([p[1] for p in pairs] + [p[0] for p in pairs[:50]]), 3_000
+    yield 'no pairs', np.zeros(0, np.int64), np.zeros(0, np.int64), 10
+
+
+@pytest.mark.parametrize('labeller', _labellers(), ids=lambda item: item[0])
+@pytest.mark.parametrize('graph', list(_graphs()), ids=lambda g: g[0])
+def test_component_labels_are_each_components_smallest_sample(labeller, graph):
+    _, device, label = labeller
+    _, rows, cols, n = graph
+    labels = label(torch.as_tensor(rows, device=device), torch.as_tensor(cols, device=device), n)
+    np.testing.assert_array_equal(labels.cpu().numpy(), _components_reference(np.asarray(rows), np.asarray(cols), n))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_the_union_find_runs_on_this_gpu():
+    major, minor = torch.cuda.get_device_capability()
+    assert CUDA_UNION_FIND, f'the prebuilt union-find (pymodules/native) does not launch on sm_{major}{minor}'
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_families_are_the_same_whichever_labelling_runs(device, monkeypatch):
+    ids, rows, dense, covariates, y = _panel(seed=31, n=400)
+    kin = _kinship(ids, rows)
+    default = kin.families(torch.device(device))
+    monkeypatch.setattr(gpu, 'union_find_available', lambda device: False)
+    fallback = kin.families(torch.device(device))
+    assert torch.equal(default['diagonal'], fallback['diagonal'])
+    for (size, index, blocks), (size2, index2, blocks2) in zip(default['groups'], fallback['groups']):
+        assert size == size2 and torch.equal(index, index2) and torch.equal(blocks, blocks2)
+
+
 def test_kinship_rows_follow_the_cpp_rules(tmp_path):
     path = tmp_path / 'kin.txt'
     path.write_text('ID1\tID2\tkinship\n'

@@ -1,10 +1,10 @@
 # TorchGWAS2
 
-A GPU-accelerated genome-wide association study (GWAS) tool ([Preprint](https://www.medrxiv.org/content/10.64898/2026.09.10.26362744v1)). TorchGWAS2 fits a linear mixed null model on CPU (C++ / Intel MKL / SuiteSparse), then streams genotype dosages and tests each variant for association on GPU or CPU (PyTorch).
+A GPU-accelerated genome-wide association study (GWAS) tool ([Preprint](https://www.medrxiv.org/content/10.64898/2026.09.10.26362744v1)). TorchGWAS2 fits a mixed null model (linear for quantitative phenotypes, logistic for binary ones) on CPU (C++ / Intel MKL / SuiteSparse) or GPU (PyTorch), then streams genotype dosages and tests each variant for association on GPU or CPU (PyTorch).
 
 ## Features
 
-- **Null model fitting** — CPU, or GPU with `--null-device cuda`; mixed-model, optional kinship/relatedness correction
+- **Null model fitting** — CPU, or GPU with `--null-device cuda`, which fits every phenotype together and writes the same correction file; linear mixed model for quantitative phenotypes and logistic (PQL) for binary 0/1 ones, optional kinship/relatedness correction. With 100,000 samples (30% related) and 1000 binary phenotypes, step 1 took 8 s on one H200 against 292 s on 8 CPU threads.
 - **Association testing** — GPU (CUDA) or CPU, multiple phenotypes in one pass
 - **Genotype formats** — BGEN, and PLINK 1.x BED/BIM/FAM
 - **Streaming I/O** — genotypes are read and tested in chunks, not loaded whole into memory
@@ -51,7 +51,7 @@ docker run --rm \
     --verbose --convert
 ```
 
-Drop `--gpus all` and pass `--device cpu` to run without a GPU. See [OPTIONS.md](OPTIONS.md) for the full option list, BED input, MAF filtering, kinship, and pipeline steps (`--step step1`/`step2`/`step3`).
+Add `--null-device cuda` to fit the null model on the GPU as well. Drop `--gpus all` and pass `--device cpu` to run without a GPU. See [OPTIONS.md](OPTIONS.md) for the full option list, BED input, MAF filtering, kinship, and pipeline steps (`--step step1`/`step2`/`step3`).
 
 ## Previous work
 Please see our previous work [TorchGWAS](https://github.com/ZhiGroup/TorchGWAS) and the accompanying article: [TorchGWAS : GPU-accelerated GWAS for thousands of quantitative phenotypes](https://arxiv.org/abs/2604.21095)
