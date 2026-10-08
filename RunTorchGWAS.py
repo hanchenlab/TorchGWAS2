@@ -110,6 +110,10 @@ def parse_args():
     parser.add_argument("--kin-file", type=str, default="", help="Kinship file path (optional, required for step1 and step2 if using kinship)")
     parser.add_argument("--kin-diag", type=float, default=1.0, help="Diagonal value of " \
                         "kinship matrix that not accounting for inbreeding (Default: 1.0)")
+    parser.add_argument("--kin-threshold", type=float, default=None,
+                        help="With --null-device cuda: drop kinship pairs below this value, in the kinship file's "
+                             "units. Default: the kinship is used as given when it is relatives-only (no family "
+                             "of more than 8192 samples), else thresholded at 0.05 x its median diagonal.")
     parser.add_argument("--corr-file", type=str, default="correction.txt", help="correction file path (required for step2)")
     parser.add_argument("--pheno-delim", type=str, default=",", help="Phenotype file delimiter (default: comma)")
     parser.add_argument("--cov-delim", type=str, default=",", help="Covariate file delimiter (default: comma)")
@@ -190,8 +194,8 @@ def validate_args(args):
     Ensure kinship-related options are only used when --kin-file is provided.
     """
     if not args.kin_file:
-        if args.kin_delim != "," or args.kin_diag != 1.0:
-            logging.error("--kin-delim or --kin-diag cannot be used without --kin-file.")
+        if args.kin_delim != "," or args.kin_diag != 1.0 or args.kin_threshold is not None:
+            logging.error("--kin-delim, --kin-diag or --kin-threshold cannot be used without --kin-file.")
             raise SystemExit(2)
 
 def resolve_geno_input(args):
@@ -329,16 +333,22 @@ def build_conf_step2(args):
     )
     return confopt
 
-def fit_null_model_step1(args, confopt):
-    """Step 1: on the GPU with --null-device cuda when the GPU null model covers the case, else the C++ step 1."""
+def fit_null_model_step1(args, confopt, keep_on_device=False):
+    """Step 1: on the GPU with --null-device cuda when the GPU null model covers the case, else the C++ step 1.
+
+    Both write the correction file. With keep_on_device, a GPU fit also returns
+    step 2's inputs in memory (see run_gwas); otherwise this returns None.
+    """
     if args.null_device == "cuda":
         from pymodules.NullModelGPU import fit_step1_gpu
-        reason = fit_step1_gpu(args, normalize_delim(args.pheno_delim), normalize_delim(args.cov_delim),
-                               normalize_delim(args.kin_delim), log=logging.info)
+        in_memory, reason = fit_step1_gpu(args, normalize_delim(args.pheno_delim), normalize_delim(args.cov_delim),
+                                          normalize_delim(args.kin_delim), log=logging.info,
+                                          keep_on_device=keep_on_device)
         if reason is None:
-            return
+            return in_memory
         logging.info("GPU null model not used (%s); fitting the null model on the CPU.", reason)
     GEMRunner(confopt.get()).run_fit_nullmodel()
+    return None
 
 
 def run_all(dir_name, base_name, args, log_file):
@@ -353,8 +363,8 @@ def run_all(dir_name, base_name, args, log_file):
     sub_step1.sample = args.sample[0]
     conf_step1 = build_conf_step1(sub_step1)
     corr_file = args.corr_file
-    #Null model
-    fit_null_model_step1(sub_step1, conf_step1)
+    #Null model; a GPU fit hands its residuals to step 2 in memory (the file is still written)
+    null_model = fit_null_model_step1(sub_step1, conf_step1, keep_on_device=True)
     logging.info("correction file (correction) path: %s", corr_file)
     setup_pipeline_log(log_file, mode="a")
     # ------------------
@@ -385,13 +395,14 @@ def run_all(dir_name, base_name, args, log_file):
         conf_step2 = build_conf_step2(sub_step2)
 
         TGWAS_file = os.path.join(dir_name, base_i + ".parquet")
-        runner = GEMRunner(conf_step2.get(), True) 
+        runner = GEMRunner(conf_step2.get(), True)
         run_gwas(
             runner,
             corr_file,               # correction file
             TGWAS_file,
             snps_per_chunk=args.stream_snps,
             device=args.device,
+            null_model=null_model,
         )
         print(f"TGWAS parquet output: {TGWAS_file}")
 

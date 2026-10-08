@@ -43,10 +43,21 @@ no basis diagonalises it; there each family block is inverted per phenotype at
 every iteration, a batch of small dense inverses, and singletons are
 elementwise.
 
+The kinship. A family with a negative eigenvalue (an estimated or thresholded
+kinship can have one) is replaced by its nearest positive semi-definite matrix,
+U max(lambda, 0) U', and logged. A kinship that is not relatives-only (a family
+of more than MAX_BLOCK samples; a dense GRM is one family of all of them) is
+thresholded by default, dropping the pairs below 0.05 times the median diagonal
+(fastGWA's 0.05 on the GRM scale), and logged; --kin-threshold sets the cutoff.
+The C++ step 1 uses the kinship as given, so it agrees with this one exactly
+when the kinship is relatives-only and positive semi-definite.
+
 Not handled here, and left to the C++ step 1: a binary phenotype not coded 0/1,
 repeated measures (duplicated sample IDs in the covariate file) and random
 slopes. fit_step1_gpu() returns the reason without writing anything, and the
-caller runs the C++ step 1.
+caller runs the C++ step 1. When step 2 follows in the same process
+(--step all), fit_step1_gpu() can also hand over the residuals still on the
+GPU, so step 2 does not parse them back from the correction file.
 
 Inputs are read with the C++ step 1's rules: genotype sample IDs are the first
 token of each .sample line after its two header lines (the .fam IID for BED);
@@ -69,8 +80,11 @@ import torch
 TOL = 1e-5
 MAX_ITER = 500
 # A family larger than this is a dense (batch x s x s) block per phenotype;
-# such a kinship is not relatives-only and is left to the C++ step 1.
+# such a kinship is not relatives-only, and relatives_only() thresholds it.
 MAX_BLOCK = 8192
+# relatives_only()'s default cutoff, times the median kinship diagonal:
+# fastGWA's 0.05 on the GRM scale.
+DEFAULT_THRESHOLD = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +137,16 @@ def read_step1_inputs(args, pheno_delim, cov_delim):
     if id_col not in pheno_header:
         raise ValueError(f'phenotype file has no column {id_col!r}')
     traits = pheno_header[2:]
-    pheno = pd.read_csv(args.pheno_file, sep=pheno_delim, dtype={name: str for name in pheno_header[:2] + [id_col]},
-                        keep_default_na=False, na_values=['', missing])
-    pheno_ids = pheno[id_col].astype(str).to_numpy()
+    # pyarrow parses on several threads and rounds each value correctly, as std::stod does.
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+    id_cols = set(pheno_header[:2] + [id_col])
+    pheno = pacsv.read_csv(args.pheno_file, parse_options=pacsv.ParseOptions(delimiter=pheno_delim),
+                           convert_options=pacsv.ConvertOptions(
+                               column_types={name: pa.string() if name in id_cols else pa.float64()
+                                             for name in pheno_header},
+                               null_values=['', missing], strings_can_be_null=False))
+    pheno_ids = pheno.column(id_col).to_numpy(zero_copy_only=False).astype(str)
     if len(pheno_ids) != len(cov_ids):
         raise ValueError('the phenotype and covariate files have different numbers of samples (rows)')
     mismatch = np.flatnonzero(pheno_ids != cov_ids)
@@ -148,7 +169,9 @@ def read_step1_inputs(args, pheno_delim, cov_delim):
     if not ids:
         raise ValueError('no genotype sample has complete covariates')
     rows = np.asarray(rows)
-    y = pheno[traits].iloc[rows].to_numpy(dtype=np.float64)
+    y = np.empty((len(rows), len(traits)), order='F')     # each phenotype's column contiguous
+    for k, name in enumerate(traits):
+        y[:, k] = pheno.column(name).to_numpy(zero_copy_only=False)[rows]   # nulls become NaN
     # Only the kept rows: the others may hold the missing-value token.
     x = cov[covariates].iloc[rows].to_numpy(dtype=np.float64) if covariates else None
     return dict(ids=ids, traits=traits, y=y, x=x), None
@@ -236,26 +259,26 @@ def read_kinship(path, delim, ids, diagonal):
 # The kinship's families
 # ---------------------------------------------------------------------------
 
+class FamilyTooLarge(ValueError):
+    """A kinship family larger than MAX_BLOCK, even after thresholding (relatives_only)."""
+
+
 class Kinship:
     """A symmetric sparse kinship over the analysed samples: K_ii and each unordered off-diagonal pair once."""
 
     def __init__(self, n, diagonal, rows, cols, values):
         self.n, self.diagonal, self.rows, self.cols, self.values = n, diagonal, rows, cols, values
 
-    def trace(self):
-        return float(self.diagonal.sum())
-
-    def families(self, device):
-        """Connected components as (size, sample indices B x size, blocks B x size x size), on `device`.
+    def _family_of(self, device):
+        """Each sample's family number (0 ..), and the family sizes, on `device`.
 
         Minimum-label propagation over the pairs with pointer jumping: a label
         is always a sample of its own component no larger than itself, so when
         no pair changes one, each component carries its smallest index.
         """
-        n = self.n
         rows = torch.as_tensor(self.rows, dtype=torch.int64, device=device)
         cols = torch.as_tensor(self.cols, dtype=torch.int64, device=device)
-        label = torch.arange(n, device=device)
+        label = torch.arange(self.n, device=device)
         while rows.numel():
             low = torch.minimum(label[rows], label[cols])
             new = label.scatter_reduce(0, rows, low, 'amin').scatter_reduce_(0, cols, low, 'amin')
@@ -264,10 +287,35 @@ class Kinship:
                 break
             label = new
         _, family = torch.unique(label, return_inverse=True)
-        sizes = torch.bincount(family)
+        return family, torch.bincount(family)
+
+    def largest_family(self, device):
+        return int(self._family_of(device)[1].max())
+
+    def without_pairs_below(self, cutoff):
+        """This kinship with the off-diagonal pairs below `cutoff` dropped (the diagonal kept)."""
+        kept = self.values >= cutoff
+        return Kinship(self.n, self.diagonal, self.rows[kept], self.cols[kept], self.values[kept])
+
+    def families(self, device):
+        """The connected components, each made positive semi-definite, on `device`: a dict of
+
+        groups: (size, sample indices B x size, blocks B x size x size) per family size;
+        diagonal: K_ii for every sample (N), and trace, its sum;
+        clipped, lowest: how many families had a negative eigenvalue below -1e-10, and the lowest.
+
+        A family with a negative eigenvalue (a thresholded or estimated
+        kinship can have one) has its block replaced by U max(lambda, 0) U',
+        the nearest positive semi-definite matrix; a negative singleton
+        diagonal becomes 0.
+        """
+        n = self.n
+        rows = torch.as_tensor(self.rows, dtype=torch.int64, device=device)
+        cols = torch.as_tensor(self.cols, dtype=torch.int64, device=device)
+        family, sizes = self._family_of(device)
         if int(sizes.max()) > MAX_BLOCK:
-            raise ValueError(f'a family of {int(sizes.max())} related samples exceeds {MAX_BLOCK}; '
-                             'the GPU null model needs a relatives-only kinship')
+            raise FamilyTooLarge(f'a family of {int(sizes.max())} related samples, more than {MAX_BLOCK}: '
+                                 'the GPU null model needs a relatives-only kinship (see relatives_only)')
         order = torch.sort(family, stable=True).indices
         starts = torch.cumsum(sizes, 0) - sizes
         position = torch.empty(n, dtype=torch.int64, device=device)
@@ -275,6 +323,10 @@ class Kinship:
         diagonal = torch.as_tensor(self.diagonal, dtype=torch.float64, device=device)
         values = torch.as_tensor(self.values, dtype=torch.float64, device=device)
         groups = []
+        single = sizes[family] == 1          # a singleton's eigenvalue is its diagonal
+        lowest = float(diagonal[single].min()) if single.any() else math.inf
+        clipped = int((diagonal[single] < -1e-10).sum())
+        out_diagonal = diagonal.clamp(min=0)
         for size in torch.unique(sizes).tolist():
             members = (sizes == size).nonzero()[:, 0]
             slot = torch.full_like(sizes, -1)
@@ -289,13 +341,50 @@ class Kinship:
             i, j = position[rows[pairs]], position[cols[pairs]]
             blocks[b, i, j] = values[pairs]
             blocks[b, j, i] = values[pairs]
+            if size > 1:
+                lam, u = torch.linalg.eigh(blocks)
+                lowest = min(lowest, float(lam[:, 0].min()))
+                negative = lam[:, 0] < 0
+                if negative.any():
+                    clipped += int((lam[:, 0] < -1e-10).sum())
+                    fixed = (u[negative] * lam[negative].clamp(min=0)[:, None, :]) @ u[negative].transpose(1, 2)
+                    blocks[negative] = (fixed + fixed.transpose(1, 2)) / 2
+                out_diagonal[index] = blocks.diagonal(dim1=1, dim2=2)
             groups.append((int(size), index, blocks))
-        return groups
+        return dict(groups=groups, diagonal=out_diagonal, trace=float(out_diagonal.sum()), clipped=clipped,
+                    lowest=lowest)
 
 
 # ---------------------------------------------------------------------------
 # The fit
 # ---------------------------------------------------------------------------
+
+def relatives_only(kinship, device, threshold=None):
+    """The kinship to fit, and a log line saying what was done to it (None when it is used as given).
+
+    threshold None (the default): the kinship is used as given when no family
+    has more than MAX_BLOCK samples; otherwise the pairs below DEFAULT_THRESHOLD
+    times the median diagonal are dropped (0.05 on the GRM scale, 2 x kinship;
+    0.025 on the kinship scale). A number: the pairs below it, in the kinship
+    file's units, are dropped. A family still larger than MAX_BLOCK is an error.
+    """
+    largest = kinship.largest_family(device)
+    if threshold is None and largest <= MAX_BLOCK:
+        return kinship, None
+    if threshold is None:
+        cutoff = DEFAULT_THRESHOLD * float(np.median(kinship.diagonal))
+        why = (f'the default, {DEFAULT_THRESHOLD} x the median diagonal, as a family had {largest} samples, '
+               f'more than {MAX_BLOCK}')
+    else:
+        cutoff, why = float(threshold), '--kin-threshold'
+    thresholded = kinship.without_pairs_below(cutoff)
+    after = thresholded.largest_family(device)
+    if after > MAX_BLOCK:
+        raise FamilyTooLarge(f'after dropping kinship pairs below {cutoff:.4g} a family of {after} samples remains, '
+                             f'more than {MAX_BLOCK}; set a higher --kin-threshold (in the kinship file\'s units)')
+    return thresholded, (f'kinship thresholded at {cutoff:.4g} ({why}): kept {len(thresholded.values)} of '
+                         f'{len(kinship.values)} related pairs; largest family {largest} -> {after} samples')
+
 
 def design_matrix(covariates, n):
     """[1, covariates], dropping a covariate collinear with those before it.
@@ -312,14 +401,16 @@ def design_matrix(covariates, n):
     return columns[:, keep]
 
 
-def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITER, names=None, binary=None):
+def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITER, names=None, binary=None,
+                   keep_on_device=False):
     """Every phenotype column's null model (NaN marks a missing value): a dict of per-phenotype arrays.
 
     pseudo (N x K, a view of a phenotype-major array) is c1 P y with zeros
     where missing; c1, c2, tau (K x 2: tau_e, tau_g; tau_e is 1 for a binary
     phenotype), iterations, converged and binary per phenotype. Quantitative
     and binary phenotypes may be mixed; `binary` is column_kinds()'s, computed
-    when not given.
+    when not given. With keep_on_device, pseudo_device is pseudo as float32 on
+    `device` (N x K), what step 2 computes with.
     """
     n, traits = y_all.shape
     x = design_matrix(covariates, n)
@@ -327,21 +418,25 @@ def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITE
     xt = torch.as_tensor(x, device=device, dtype=torch.float64)
     if binary is None:
         binary = column_kinds(y_all, device)[0]
-    groups = None if kinship is None else kinship.families(device)
+    families = None if kinship is None else kinship.families(device)
     linear = logistic = None
     per_trait = 8 * 12 * n
-    if groups is not None and not binary.all():
-        linear = _Families(kinship, groups, x, device)
+    if families is not None and not binary.all():
+        linear = _Families(families, x, device)
         per_trait = max(per_trait, 8 * (28 * n + sum(g['index'].shape[0] * g['size'] * (4 * g['size'] + p)
                                                      for g in linear.groups)))
-    if groups is not None and binary.any():
-        logistic = _Blocks(kinship, groups, xt)
+    if families is not None and binary.any():
+        logistic = _Blocks(families, xt)
         per_trait = max(per_trait, 8 * (24 * n + sum(g['count'] * g['size'] * (6 * g['size'] + 3 * p)
                                                      for g in logistic.groups)))
     batch = int(max(1, min(traits, _budget(device) // per_trait)))
     pseudo_t = np.empty((traits, n))
     out = dict(pseudo=pseudo_t.T, c1=np.empty(traits), c2=np.empty(traits), tau=np.empty((traits, 2)),
-               iterations=np.empty(traits, np.int64), converged=np.empty(traits, bool), binary=binary)
+               iterations=np.empty(traits, np.int64), converged=np.empty(traits, bool), binary=binary,
+               clipped=0 if families is None else families['clipped'],
+               lowest_eigenvalue=None if families is None else families['lowest'])
+    if keep_on_device:      # samples x phenotypes, contiguous: the layout step 2 builds from the file
+        kept = out['pseudo_device'] = torch.empty((n, traits), dtype=torch.float32, device=device)
     for first in range(0, traits, batch):
         stop = min(traits, first + batch)
         y = _columns_to_device(y_all, first, stop, device)
@@ -372,6 +467,8 @@ def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITE
             for key in ('c1', 'c2', 'tau', 'iterations', 'converged'):
                 out[key][first + local] = fit[key].cpu().numpy()
         torch.from_numpy(pseudo_t[first:stop]).copy_(pseudo)
+        if keep_on_device:
+            kept[:, first:stop] = pseudo.T
     return out
 
 
@@ -398,15 +495,15 @@ class _Families:
     eigencomponent i of family b. Singletons are their own eigenbasis.
     """
 
-    def __init__(self, kinship, groups, x, device):
+    def __init__(self, families, x, device):
         self.t = dict(device=device, dtype=torch.float64)
         self.n, self.p = x.shape
-        self.trace_all = kinship.trace()
-        self.kin_diag = torch.as_tensor(kinship.diagonal, **self.t)
+        self.trace_all = families['trace']
+        self.kin_diag = families['diagonal']
         xt = self.x0 = torch.as_tensor(x, **self.t)
         self.x = xt.clone()
         self.groups, self.sizes = [], []
-        for size, index, kin in groups:
+        for size, index, kin in families['groups']:
             self.sizes.append((size, int(index.shape[0])))
             if size == 1:
                 continue
@@ -676,22 +773,22 @@ class _Blocks:
     N x k array are a B x s x k view.
     """
 
-    def __init__(self, kinship, groups, xt):
+    def __init__(self, families, xt):
         self.n, self.p = xt.shape
-        self.trace_all = kinship.trace()
-        families = [(size, index, kin) for size, index, kin in groups if size > 1]
+        self.trace_all = families['trace']
+        related = [(size, index, kin) for size, index, kin in families['groups'] if size > 1]
         lone = torch.ones(self.n, dtype=torch.bool, device=xt.device)
-        for _, index, _ in families:
+        for _, index, _ in related:
             lone[index.reshape(-1)] = False
-        self.order = torch.cat([lone.nonzero()[:, 0]] + [index.reshape(-1) for _, index, _ in families])
+        self.order = torch.cat([lone.nonzero()[:, 0]] + [index.reshape(-1) for _, index, _ in related])
         self.lone = int(lone.sum())
         self.x = xt[self.order]
         single = self.x[:self.lone]
         self.outer = (single[:, :, None] * single[:, None, :]).reshape(self.lone, self.p * self.p)
-        self.kin_diag = torch.as_tensor(kinship.diagonal, dtype=xt.dtype, device=xt.device)[self.order, None]
+        self.kin_diag = families['diagonal'][self.order, None]
         self.kin_lone = self.kin_diag[:self.lone]
         self.groups, start = [], self.lone
-        for size, index, kin in families:
+        for size, index, kin in related:
             count = index.shape[0]
             self.groups.append(dict(size=size, count=count, rows=slice(start, start + count * size), kin=kin,
                                     x=self.x[start:start + count * size].view(count, size, self.p)))
@@ -899,22 +996,35 @@ def write_correction_file(path, traits, c2, ids, pseudo, threads=8):
             handle.write(chunk)
 
 
-def fit_step1_gpu(args, pheno_delim, cov_delim, kin_delim, log=print):
-    """Run step 1 on the GPU and write args.corr_file; return None, or why the C++ step 1 should run instead."""
+def fit_step1_gpu(args, pheno_delim, cov_delim, kin_delim, log=print, keep_on_device=False):
+    """Run step 1 on the GPU and write args.corr_file: (in_memory, None), or (None, why the C++ step 1 should run).
+
+    in_memory is None unless keep_on_device; then it holds what step 2 reads
+    from the correction file, as read_correction_file returns it (header, c2,
+    residuals, sample IDs), with the residuals the float32 values on the GPU.
+    """
     if not torch.cuda.is_available():
-        return 'no CUDA device'
+        return None, 'no CUDA device'
     started = time.time()
     inputs, reason = read_step1_inputs(args, pheno_delim, cov_delim)
     if reason is not None:
-        return reason
+        return None, reason
     device = torch.device('cuda', torch.cuda.current_device())
     binary, reason = check_binary_coding(inputs['y'], inputs['traits'], device)
     if reason is not None:
-        return reason
+        return None, reason
     kinship = (read_kinship(args.kin_file, kin_delim, inputs['ids'], args.kin_diag) if args.kin_file else None)
+    if kinship is not None:
+        kinship, note = relatives_only(kinship, device, getattr(args, 'kin_threshold', None))
+        if note:
+            log(f'GPU null model: {note}')
     read_seconds = time.time() - started
     fitted = time.time()
-    fit = fit_null_model(inputs['y'], inputs['x'], kinship, device, names=inputs['traits'], binary=binary)
+    fit = fit_null_model(inputs['y'], inputs['x'], kinship, device, names=inputs['traits'], binary=binary,
+                         keep_on_device=keep_on_device)
+    if fit['clipped']:
+        log(f'GPU null model: {fit["clipped"]} kinship families had a negative eigenvalue (lowest '
+            f'{fit["lowest_eigenvalue"]:.4g}); each was replaced by its nearest positive semi-definite matrix')
     torch.cuda.synchronize(device)
     fit_seconds = time.time() - fitted
     written = time.time()
@@ -936,4 +1046,6 @@ def fit_step1_gpu(args, pheno_delim, cov_delim, kin_delim, log=print):
                 handle.write(f'{name}\t{model}\t{fit["tau"][k, 0]:.10g}\t{fit["tau"][k, 1]:.10g}\t'
                              f'{fit["c1"][k]:.10g}\t{fit["c2"][k]:.10g}\t{fit["iterations"][k]}\t'
                              f'{int(fit["converged"][k])}\n')
-    return None
+    if not keep_on_device:
+        return None, None
+    return (['sample_id'] + list(inputs['traits']), fit['c2'], fit['pseudo_device'], list(inputs['ids'])), None

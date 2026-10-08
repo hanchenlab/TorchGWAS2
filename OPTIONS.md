@@ -88,6 +88,7 @@ Sample IDs for BED input are read from the `.fam` file's second column (IID) and
 | `--kin-file` | path | Pairwise kinship matrix file (three columns: ID1, ID2, value). If omitted, samples are treated as unrelated. | *(none)* |
 | `--kin-diag` | float | Diagonal value for the kinship matrix (e.g. `0.5` if not accounting for inbreeding). | `1.0` |
 | `--kin-delim` | delimiter | Kinship file delimiter. See [File delimiter options](#file-delimiter-options). | `,` |
+| `--kin-threshold` | float | With `--null-device cuda`: drop kinship pairs below this value, in the kinship file's units (e.g. `0.05` for a GRM, i.e. 2 × kinship with diagonal ≈ 1; `0.025` for a kinship with diagonal ≈ 0.5). By default the kinship is used as given when it is relatives-only (no family of more than 8192 related samples), and otherwise thresholded at 0.05 × its median diagonal, which is logged. On the GPU, a family whose kinship block has a negative eigenvalue is also replaced by the nearest positive semi-definite matrix (logged). The CPU fit uses the kinship as given. | *(automatic)* |
 
 ## File delimiter options
 

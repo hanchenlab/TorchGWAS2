@@ -354,10 +354,68 @@ def test_unsupported_cases_are_left_to_the_cpp_step1(tmp_path):
     assert 'random slope' in gpu.read_step1_inputs(args, '\t', '\t')[1]
 
 
+def _dense(rows, n):
+    dense = np.zeros((n, n))
+    for a, b, v in rows:
+        dense[int(a[1:]), int(b[1:])] = dense[int(b[1:]), int(a[1:])] = v
+    return dense
+
+
+def test_a_kinship_that_is_not_relatives_only_is_thresholded(monkeypatch):
+    ids, rows, dense, covariates, y = _panel()
+    cpu = torch.device('cpu')
+    monkeypatch.setattr(gpu, 'MAX_BLOCK', 6)     # the panel's families have up to 6 members
+    sparse = _kinship(ids, rows)
+    assert gpu.relatives_only(sparse, cpu) == (sparse, None)
+    # Weak pairs (0.01) chaining consecutive samples join everything into one family.
+    chained = _kinship(ids, rows + [(ids[i], ids[i + 1], 0.01) for i in range(len(ids) - 1)
+                                    if dense[i, i + 1] == 0])
+    assert chained.largest_family(cpu) == len(ids)
+    kept, note = gpu.relatives_only(chained, cpu)        # default: 0.05 x the median diagonal (1)
+    assert 'default' in note and kept.largest_family(cpu) <= 6
+    assert sorted(zip(kept.rows, kept.cols, kept.values)) == sorted(zip(sparse.rows, sparse.cols, sparse.values))
+    kept, note = gpu.relatives_only(sparse, cpu, threshold=0.6)   # drops every 0.5 pair
+    assert '--kin-threshold' in note and len(kept.values) == 0
+    monkeypatch.setattr(gpu, 'MAX_BLOCK', 3)
+    with pytest.raises(gpu.FamilyTooLarge, match='kin-threshold'):
+        gpu.relatives_only(chained, cpu)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_a_family_with_a_negative_eigenvalue_is_made_positive_semidefinite(device):
+    ids, rows, dense, covariates, y = _panel(seed=29, n=300)
+    # Three members of one family with kinships 0.9, 0.9, -0.9: their block's
+    # eigenvalues include -0.8, so the whole family's block has a negative one.
+    pairs = {(a, b) for a, b, v in rows if a != b}
+    i = next(int(a[1:]) for a, b in sorted(pairs) if int(b[1:]) == int(a[1:]) + 2)
+    new = {(ids[i], ids[i + 1]): 0.9, (ids[i], ids[i + 2]): 0.9, (ids[i + 1], ids[i + 2]): -0.9}
+    rows = [(a, b, new.get((a, b), v)) for a, b, v in rows]
+    lam, u = np.linalg.eigh(_dense(rows, len(ids)))
+    assert lam[0] < -0.5
+    clipped = (u * np.maximum(lam, 0)) @ u.T            # the same as clipping block by block
+    kin = _kinship(ids, rows)
+    y[:, 3:] = _binary(y[:, 3:])
+    fit = gpu.fit_null_model(y, covariates, kin, torch.device(device))
+    assert fit['clipped'] == 1 and fit['lowest_eigenvalue'] < -0.5
+    for columns, reference in (([0, 1, 2], _reference), ([3, 4, 5], _reference_binary)):
+        want = reference(y[:, columns], covariates, clipped)
+        np.testing.assert_allclose(fit['tau'][columns], want['tau'], rtol=1e-7, atol=1e-10)
+        np.testing.assert_allclose(fit['c2'][columns], want['c2'], rtol=1e-8)
+        np.testing.assert_allclose(fit['pseudo'][:, columns], want['pseudo'], rtol=1e-7, atol=1e-10)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 def test_step1_writes_the_cpp_correction_file(tmp_path):
     args, ids, rows, dense, covariates, y = _step1_files(tmp_path, binary=(0.0, 1.0))
-    assert gpu.fit_step1_gpu(args, '\t', '\t', '\t') is None
+    assert gpu.fit_step1_gpu(args, '\t', '\t', '\t') == (None, None)
+    # What --step all hands to step 2 in memory is what step 2 reads from the file, as float32.
+    (header, c2_kept, kept, kept_ids), reason = gpu.fit_step1_gpu(args, '\t', '\t', '\t', keep_on_device=True)
+    lines = (tmp_path / 'corr.txt').read_text().splitlines()
+    assert reason is None and header == lines[0].split('\t') and kept.is_cuda and kept.dtype == torch.float32
+    assert kept_ids == [line.split('\t')[0] for line in lines[2:]]
+    np.testing.assert_array_equal(c2_kept, [float(v) for v in lines[1].split('\t')[1:]])
+    from_file = np.array([[float(v) for v in line.split('\t')[1:]] for line in lines[2:]]).astype(np.float32)
+    np.testing.assert_array_equal(kept.cpu().numpy(), from_file)
     lines = (tmp_path / 'corr.txt').read_text().splitlines()
     assert lines[0] == 'sample_id\ty0\ty1\ty2\ty3'
     assert lines[1].startswith('#\t')
