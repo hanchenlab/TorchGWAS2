@@ -20,25 +20,36 @@ def read_correction_file(file_path: str):
         - c2: numpy array of double (values from 2nd line after '#')
         - c_res: numpy 2D array of double (corrected residuals values)
     """
+    import pyarrow.csv as pacsv
     c2 = np.empty(0, dtype=np.float64)
-    c_res = []
-    sample_ids = []
-    
+
     with open(file_path, "r") as f:
         header = f.readline().strip().split("\t")
         second_line = f.readline().strip().split("\t")
         if second_line[0].startswith("#"):
             c2 = np.array([float(val) for val in second_line if not val.startswith("#")],
               dtype=np.float64)
-                          
 
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 2:
-                sample_ids.append(parts[0])
-                c_res.append([float(x) for x in parts[1:]])
-
-    c_res = np.array(c_res, dtype=np.float64)
+    # The rows (sample ID, then one value per phenotype) are parsed by pyarrow on
+    # every available core: its pool follows OMP_NUM_THREADS, which the image
+    # sets to 1. A row with fewer than two fields is skipped, as before.
+    threads = len(os.sched_getaffinity(0))
+    if pa.cpu_count() < threads:
+        pa.set_cpu_count(threads)
+    width = len(header)
+    names = [f"c{k}" for k in range(width)]
+    table = pacsv.read_csv(
+        file_path,
+        read_options=pacsv.ReadOptions(skip_rows=2, column_names=names),
+        parse_options=pacsv.ParseOptions(
+            delimiter="\t",
+            invalid_row_handler=lambda row: "skip" if row.actual_columns < 2 else "error"),
+        convert_options=pacsv.ConvertOptions(
+            column_types={name: pa.string() if k == 0 else pa.float64() for k, name in enumerate(names)}))
+    sample_ids = table.column(0).to_pylist()
+    c_res = np.empty((table.num_rows, width - 1), dtype=np.float64)   # samples x phenotypes, row-major as before
+    for k in range(1, width):
+        c_res[:, k - 1] = table.column(k).to_numpy(zero_copy_only=False)
 
     return header, c2, c_res, sample_ids
 
