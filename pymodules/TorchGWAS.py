@@ -273,13 +273,18 @@ def calc_t(corrected_res, geno, beta, gamma, sqrt_c2, ph_std):
         return geno_mean, geno_std, t_stats, beta_coeffs, se
 
 
-def run_gwas(runner, corr_file, TGWAS_file, snps_per_chunk=1000, device='cuda', null_model=None):
+def run_gwas(runner, corr_file, TGWAS_file, snps_per_chunk=1000, device='cuda', null_model=None,
+             exact_score=None):
     """
     Run GWAS using a pre-configured GEMRunner instance.
 
     null_model: step 1's results already in memory, as read_correction_file
     returns them (the residuals may be a float32 tensor on the GPU); used
     instead of reading them from corr_file.
+
+    exact_score (ExactScoreGPU.ExactScoreSpec, --exact-score): the quantitative
+    phenotypes' BETA, SE and p are those of the exact mixed-model score test,
+    each on its own observed samples, instead of the calibrated statistic.
     """
     # dir_name = os.path.dirname(out_file)
     # base_name = os.path.basename(out_file)
@@ -304,6 +309,9 @@ def run_gwas(runner, corr_file, TGWAS_file, snps_per_chunk=1000, device='cuda', 
     # Validate sample ids length matches residual rows
     if len(resid_sample_ids) != n_samples:
         print(f"Warning: intermediate file sample ID count ({len(resid_sample_ids)}) != residual rows ({n_samples}).")
+
+    # NaN marks a missing value in step 1's --exact-score residuals: kept for the exact test.
+    exact_residuals = corrected_res if exact_score is not None else None
 
     # Center phenotypes with NaN-safe mean and replace NaNs
     corrected_res = torch.nan_to_num(corrected_res, nan=0.0)
@@ -348,6 +356,17 @@ def run_gwas(runner, corr_file, TGWAS_file, snps_per_chunk=1000, device='cuda', 
 
     end_readcov = time.time()
     print(f"Time for reading covariate file and preparing projection = {end_readcov - start_readcov:.2f}s")
+
+    exact = None
+    if exact_score is not None:
+        if has_dup:
+            raise ValueError("--exact-score does not support repeated measures (duplicated sample IDs)")
+        start_exact = time.time()
+        exact, exact_columns = exact_score.build(ph_headers, resid_sample_ids, exact_residuals,
+                                                 cov_X.double(), device)
+        del exact_residuals
+        exact_columns = torch.as_tensor(exact_columns)
+        print(f"Time for preparing the exact score test = {time.time() - start_exact:.2f}s")
  
     headers = [
     "SNPID",
@@ -453,6 +472,12 @@ def run_gwas(runner, corr_file, TGWAS_file, snps_per_chunk=1000, device='cuda', 
         mean, std, t_stats, beta_coeffs, se = calc_t(
             corrected_res, geno, beta, gamma, sqrt_c2, ph_std_pre
         )
+        if exact is not None:
+            # The exact score test for the quantitative phenotypes (ExactScoreGPU.py), on the raw dosages.
+            exact_beta, exact_se, exact_z = exact(G)
+            beta_coeffs[:, exact_columns] = exact_beta.cpu()
+            se[:, exact_columns] = exact_se.cpu()
+            t_stats[:, exact_columns] = exact_z.abs().neg().cpu()
         if device.type == 'cuda':
             torch.cuda.synchronize()
         gwas_end = time.time()

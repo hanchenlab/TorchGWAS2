@@ -6,6 +6,7 @@ A GPU-accelerated genome-wide association study (GWAS) tool ([Preprint](https://
 
 - **Null model fitting** — CPU, or GPU with `--null-device cuda`, which fits every phenotype together and writes the same correction file; linear mixed model for quantitative phenotypes and logistic (PQL) for binary 0/1 ones, optional kinship/relatedness correction. With 100,000 samples (30% related) and 1000 binary phenotypes, step 1 took 8 s on one H200 against 292 s on 8 CPU threads.
 - **Association testing** — GPU (CUDA) or CPU, multiple phenotypes in one pass
+- **Exact score test** — `--exact-score` tests quantitative phenotypes by the exact mixed-model score test, each on its own observed samples, instead of the calibrated approximation (null model on the GPU)
 - **Genotype formats** — BGEN, and PLINK 1.x BED/BIM/FAM
 - **Streaming I/O** — genotypes are read and tested in chunks, not loaded whole into memory
 - **Three ways to build** — Docker (zero setup), Conda, or a manual build against libraries you already have

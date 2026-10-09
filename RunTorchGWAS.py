@@ -139,6 +139,12 @@ def parse_args():
                              "together on the GPU (pymodules/NullModelGPU.py) and writes the same correction "
                              "file; binary phenotypes not coded 0/1, repeated measures and random slopes "
                              "still use the CPU.")
+    parser.add_argument("--exact-score", action="store_true",
+                        help="Test quantitative phenotypes by the exact mixed-model score test, z = g'Py / "
+                             "sqrt(g'Pg), each on its own observed samples (GMMAT's), instead of the calibrated "
+                             "statistic. Step 1 needs --null-device cuda and then also writes <corr-file>.null.tsv "
+                             "and NaN where a value is missing; step 2 needs that file and the same kinship options. "
+                             "Binary phenotypes keep the calibrated statistic.")
     parser.add_argument("--verbose", action="store_true", help="Print null model(default: False)")
     parser.add_argument("--convert", action="store_true", help="Convert binary to text file (default: True)")
     parser.add_argument("--step", choices=["all", "step1", "step2", "step3"], default="all",
@@ -197,6 +203,10 @@ def validate_args(args):
         if args.kin_delim != "," or args.kin_diag != 1.0 or args.kin_threshold is not None:
             logging.error("--kin-delim, --kin-diag or --kin-threshold cannot be used without --kin-file.")
             raise SystemExit(2)
+    if getattr(args, "exact_score", False) and args.null_device != "cuda":
+        logging.error("--exact-score needs --null-device cuda: the GPU null model writes what the exact score "
+                      "test uses (<corr-file>.null.tsv).")
+        raise SystemExit(2)
 
 def resolve_geno_input(args):
     """
@@ -346,9 +356,20 @@ def fit_null_model_step1(args, confopt, keep_on_device=False):
                                           keep_on_device=keep_on_device)
         if reason is None:
             return in_memory
+        if getattr(args, "exact_score", False):
+            logging.error("--exact-score needs the GPU null model, which does not cover this case (%s).", reason)
+            raise SystemExit(2)
         logging.info("GPU null model not used (%s); fitting the null model on the CPU.", reason)
     GEMRunner(confopt.get()).run_fit_nullmodel()
     return None
+
+
+def exact_score_spec(args, corr_file):
+    """--exact-score: what step 2 needs to build the exact score test (ExactScoreGPU.py), else None."""
+    if not getattr(args, "exact_score", False):
+        return None
+    from pymodules.ExactScoreGPU import ExactScoreSpec
+    return ExactScoreSpec.from_args(args, corr_file, normalize_delim(args.kin_delim))
 
 
 def run_all(dir_name, base_name, args, log_file):
@@ -403,6 +424,7 @@ def run_all(dir_name, base_name, args, log_file):
             snps_per_chunk=args.stream_snps,
             device=args.device,
             null_model=null_model,
+            exact_score=exact_score_spec(args, corr_file),
         )
         print(f"TGWAS parquet output: {TGWAS_file}")
 
@@ -474,6 +496,7 @@ def run_step2(confopt, dir_name, base_i, base_name, args):
         TGWAS_file,
         snps_per_chunk=args.stream_snps,
         device=args.device,
+        exact_score=exact_score_spec(args, corr_file),
     )
 
 def run_step3(args):

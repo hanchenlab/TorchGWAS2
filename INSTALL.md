@@ -163,10 +163,10 @@ See [OPTIONS.md](OPTIONS.md) for the complete option reference, BED-format input
 The GPU null model and the correction-file reader have tests that need only the Python stack (not the C++ module) plus `pytest`:
 
 ```bash
-python -m pytest test/test_null_model_gpu.py test/test_read_correction_file.py
+python -m pytest test/test_null_model_gpu.py test/test_exact_score_gpu.py test/test_read_correction_file.py
 ```
 
-They compare the batched GPU fit with dense one-phenotype-at-a-time references of the C++ step 1's algorithm (linear AI-REML and logistic PQL, with and without kinship), the kinship file rules, the union-find against a plain reference, and the reader against its line-by-line predecessor. The fits also run on the CPU; tests that need CUDA are skipped without it.
+They compare the batched GPU fit with dense one-phenotype-at-a-time references of the C++ step 1's algorithm (linear AI-REML and logistic PQL, with and without kinship), the kinship file rules, the union-find against a plain reference, the exact score test (`--exact-score`) against a dense per-phenotype score test, and the reader against its line-by-line predecessor. The fits also run on the CPU; tests that need CUDA are skipped without it.
 
 ## Contact
 

@@ -494,7 +494,7 @@ def design_matrix(covariates, n):
 
 
 def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITER, names=None, binary=None,
-                   keep_on_device=False):
+                   keep_on_device=False, exact=False):
     """Every phenotype column's null model (NaN marks a missing value): a dict of per-phenotype arrays.
 
     pseudo (N x K, a view of a phenotype-major array) is c1 P y with zeros
@@ -503,6 +503,12 @@ def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITE
     and binary phenotypes may be mixed; `binary` is column_kinds()'s, computed
     when not given. With keep_on_device, pseudo_device is pseudo as float32 on
     `device` (N x K), what step 2 computes with.
+
+    exact=True prepares step 2's exact score test (ExactScoreGPU.py): the
+    pseudo-phenotype is NaN where missing, and a quantitative phenotype's
+    P y is taken at the final tau (the C++ step 1's convention takes it from
+    the last iteration's starting point), so that U = g' P y and V = g' P g
+    share one P.
     """
     n, traits = y_all.shape
     x = design_matrix(covariates, n)
@@ -545,7 +551,8 @@ def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITE
             index = torch.as_tensor(local, device=device)
             ys, ms = (y, m) if local.size == stop - first else (y[:, index], m[:, index])
             if not kind:
-                fit = _fit_unrelated(ys, ms, xt) if linear is None else _fit_mixed(linear, ys, ms, tol, max_iter)
+                fit = (_fit_unrelated(ys, ms, xt) if linear is None
+                       else _fit_mixed(linear, ys, ms, tol, max_iter, exact))
             else:
                 glm = _logistic_regression(ys, ms, xt, tol)
                 failed = np.flatnonzero(~glm['converged'].cpu().numpy())
@@ -558,6 +565,8 @@ def fit_null_model(y_all, covariates, kinship, device, tol=TOL, max_iter=MAX_ITE
             pseudo[index] = fit['pseudo'].T
             for key in ('c1', 'c2', 'tau', 'iterations', 'converged'):
                 out[key][first + local] = fit[key].cpu().numpy()
+        if exact:
+            pseudo = torch.where(observed.T, pseudo, torch.nan)
         torch.from_numpy(pseudo_t[first:stop]).copy_(pseudo)
         if keep_on_device:
             kept[:, first:stop] = pseudo.T
@@ -673,15 +682,15 @@ class _Families:
         return out
 
 
-def _fit_mixed(families, y, m, tol, max_iter):
+def _fit_mixed(families, y, m, tol, max_iter, exact=False):
     """AI-REML for a block of phenotypes, with the boundary refits."""
     columns = None
     fixed = torch.zeros(y.shape[1], 2, dtype=torch.bool, device=y.device)
     for _ in range(3):  # two components: at most two boundary refits
         if columns is None:
-            out = fit = _ai_reml(families, y, m, fixed, tol, max_iter)
+            out = fit = _ai_reml(families, y, m, fixed, tol, max_iter, exact)
         else:
-            fit = _ai_reml(families, y[:, columns], m[:, columns], fixed, tol, max_iter)
+            fit = _ai_reml(families, y[:, columns], m[:, columns], fixed, tol, max_iter, exact)
             out['pseudo'][:, columns] = fit['pseudo']
             for key in ('c1', 'c2', 'tau', 'alpha', 'iterations', 'converged'):
                 out[key][columns] = fit[key]
@@ -697,7 +706,7 @@ def _fit_mixed(families, y, m, tol, max_iter):
     return out
 
 
-def _ai_reml(families, y, m, fixed, tol, max_iter):
+def _ai_reml(families, y, m, fixed, tol, max_iter, exact=False):
     """AI-REML for k phenotypes at once: y (zero where missing) and its 0/1 mask m, N x k."""
     t = families.t
     n, k = y.shape
@@ -788,6 +797,9 @@ def _ai_reml(families, y, m, fixed, tol, max_iter):
         if not active.any():
             break
 
+    if exact:     # the exact score test's U and V need one P: the final tau's
+        s = state(tau)
+        final = dict(py=s['py'], tr_pk=s['tr_pk'], tau0_e=tau[:, 0])
     # Scaled residual: from the last iteration's starting point, divided by the
     # final tau_e. With tau_e fixed at zero (all variance in K) both are zero
     # and the ratio is taken as its limit, 1, where GMMAT's form gives 0/0.
@@ -1088,6 +1100,25 @@ def write_correction_file(path, traits, c2, ids, pseudo, threads=8):
             handle.write(chunk)
 
 
+def null_table_path(corr_file):
+    """Where step 1 (--exact-score) writes each phenotype's null model for step 2: beside the correction file."""
+    return Path(str(corr_file) + '.null.tsv')
+
+
+def write_null_table(path, traits, fit, observed):
+    """One row per phenotype, in the correction file's order: model, tau_e, tau_g, c1, c2, observed samples.
+
+    Step 2's exact score test (ExactScoreGPU.py) reads it: P y = e / c1, and
+    Sigma = tau_e I + tau_g K over the phenotype's observed samples.
+    """
+    with open(path, 'w') as handle:
+        handle.write('phenotype\tmodel\ttau_e\ttau_g\tc1\tc2\tn_observed\n')
+        for k, name in enumerate(traits):
+            model = 'logistic' if fit['binary'][k] else 'linear'
+            handle.write(f'{name}\t{model}\t{float(fit["tau"][k, 0])!r}\t{float(fit["tau"][k, 1])!r}\t'
+                         f'{float(fit["c1"][k])!r}\t{float(fit["c2"][k])!r}\t{int(observed[k])}\n')
+
+
 def fit_step1_gpu(args, pheno_delim, cov_delim, kin_delim, log=print, keep_on_device=False):
     """Run step 1 on the GPU and write args.corr_file: (in_memory, None), or (None, why the C++ step 1 should run).
 
@@ -1112,8 +1143,9 @@ def fit_step1_gpu(args, pheno_delim, cov_delim, kin_delim, log=print, keep_on_de
             log(f'GPU null model: {note}')
     read_seconds = time.time() - started
     fitted = time.time()
+    exact = bool(getattr(args, 'exact_score', False))
     fit = fit_null_model(inputs['y'], inputs['x'], kinship, device, names=inputs['traits'], binary=binary,
-                         keep_on_device=keep_on_device)
+                         keep_on_device=keep_on_device, exact=exact)
     if fit['clipped']:
         log(f'GPU null model: {fit["clipped"]} kinship families had a negative eigenvalue (lowest '
             f'{fit["lowest_eigenvalue"]:.4g}); each was replaced by its nearest positive semi-definite matrix')
@@ -1122,6 +1154,9 @@ def fit_step1_gpu(args, pheno_delim, cov_delim, kin_delim, log=print, keep_on_de
     written = time.time()
     threads = min(8, getattr(args, 'threads', None) or len(os.sched_getaffinity(0)))
     write_correction_file(args.corr_file, inputs['traits'], fit['c2'], inputs['ids'], fit['pseudo'], threads)
+    if exact:
+        write_null_table(null_table_path(args.corr_file), inputs['traits'], fit,
+                         (~np.isnan(inputs['y'])).sum(0))
     write_seconds = time.time() - written
     summary = (f'GPU null model: {len(inputs["ids"])} samples, {len(inputs["traits"])} phenotypes '
                f'({int(fit["binary"].sum())} binary), {0 if kinship is None else len(kinship.values)} related pairs; '
